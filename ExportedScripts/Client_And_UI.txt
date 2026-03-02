@@ -1,0 +1,815 @@
+--- StarterPlayer.StarterPlayerScripts.DriveClient (LocalScript) ---
+--[[
+	StarterPlayerScripts/DriveClient.lua (LocalScript)
+	
+	Handles:
+	- ZonePlus GameZone detection → tells server when entering/leaving
+	- Wheel spin animation (visual only, based on movement speed)
+	- Fuel bar HUD
+	- Zone status indicator
+	- Listens for morph/unmorph events from server
+--]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Player = Players.LocalPlayer
+
+------------------------------------------------------------
+-- ZONEPLUS SETUP
+------------------------------------------------------------
+local Zone = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Zone"))
+
+------------------------------------------------------------
+-- WAIT FOR REMOTES
+------------------------------------------------------------
+local Remotes = ReplicatedStorage:WaitForChild("DriveRemotes")
+local FuelUpdate = Remotes:WaitForChild("FuelUpdate")
+local MorphEvent = Remotes:WaitForChild("MorphEvent")
+local UnmorphEvent = Remotes:WaitForChild("UnmorphEvent")
+local ZoneChanged = Remotes:WaitForChild("ZoneChanged")
+local GetDriveData = Remotes:WaitForChild("GetDriveData")
+
+------------------------------------------------------------
+-- STATE
+------------------------------------------------------------
+local isMorphed = false
+local currentFuel = 0
+local maxFuel = 50
+
+local wheelSpinConnection = nil
+local driveConnection = nil
+
+------------------------------------------------------------
+-- CAR MOVEMENT TUNING
+------------------------------------------------------------
+local CAR_SETTINGS = {
+	-- How fast the car rotates to face its movement direction
+	ROTATION_SPEED = 12,      -- Higher = snappier rotation, lower = smoother arc
+
+	-- Body tilt: slight lean into turns for visual feel
+	TILT_AMOUNT = 4,          -- Degrees of body roll on turns
+	TILT_SPEED = 8,           -- How fast the tilt responds
+
+	-- Nose tilt: slight pitch when accelerating/braking  
+	PITCH_AMOUNT = 2,         -- Degrees of nose pitch
+	PITCH_SPEED = 6,          -- How fast pitch responds
+}
+
+------------------------------------------------------------
+-- CAR MOVEMENT CONTROLLER
+-- Dead simple: the Humanoid does ALL the movement normally.
+-- We just rotate the RootPart to face the velocity direction
+-- so the car always points where it's going.
+------------------------------------------------------------
+local currentTilt = 0
+local currentPitch = 0
+local lastYaw = 0
+local lastSpeed = 0
+
+local function startDriveController()
+	if driveConnection then return end
+
+	local character = Player.Character
+	if not character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not rootPart then return end
+
+	-- We handle rotation ourselves
+	humanoid.AutoRotate = false
+
+	lastYaw = math.atan2(-rootPart.CFrame.LookVector.X, -rootPart.CFrame.LookVector.Z)
+	currentTilt = 0
+	currentPitch = 0
+	lastSpeed = 0
+
+	driveConnection = RunService.Heartbeat:Connect(function(dt)
+		if not isMorphed then return end
+
+		character = Player.Character
+		if not character then return end
+		humanoid = character:FindFirstChildOfClass("Humanoid")
+		rootPart = character:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootPart then return end
+
+		local S = CAR_SETTINGS
+		local vel = rootPart.AssemblyLinearVelocity
+		local flatVel = Vector3.new(vel.X, 0, vel.Z)
+		local speed = flatVel.Magnitude
+
+		-- Only rotate when actually moving
+		if speed > 1 then
+			local desiredYaw = math.atan2(-flatVel.Unit.X, -flatVel.Unit.Z)
+
+			-- Smoothly rotate toward velocity direction
+			local yawDiff = math.atan2(math.sin(desiredYaw - lastYaw), math.cos(desiredYaw - lastYaw))
+			lastYaw = lastYaw + yawDiff * math.min(1, S.ROTATION_SPEED * dt)
+
+			-- VISUAL TILT: lean based on how much we're turning
+			local targetTilt = math.clamp(yawDiff * 30, -S.TILT_AMOUNT, S.TILT_AMOUNT)
+			currentTilt = currentTilt + (targetTilt - currentTilt) * math.min(1, S.TILT_SPEED * dt)
+
+			-- VISUAL PITCH: based on acceleration/deceleration
+			local accel = speed - lastSpeed
+			local targetPitch = math.clamp(-accel * 0.5, -S.PITCH_AMOUNT, S.PITCH_AMOUNT)
+			currentPitch = currentPitch + (targetPitch - currentPitch) * math.min(1, S.PITCH_SPEED * dt)
+		else
+			-- Stopped: ease tilt/pitch back to zero
+			currentTilt = currentTilt * (1 - math.min(1, 8 * dt))
+			currentPitch = currentPitch * (1 - math.min(1, 8 * dt))
+		end
+
+		lastSpeed = speed
+
+		-- Apply rotation to rootpart
+		local targetCF = CFrame.new(rootPart.Position) 
+			* CFrame.Angles(0, lastYaw, 0) 
+			* CFrame.Angles(math.rad(currentPitch), 0, math.rad(currentTilt))
+
+		rootPart.CFrame = rootPart.CFrame:Lerp(targetCF, math.min(1, S.ROTATION_SPEED * dt))
+	end)
+end
+
+local function stopDriveController()
+	if driveConnection then
+		driveConnection:Disconnect()
+		driveConnection = nil
+	end
+
+	local character = Player.Character
+	if character then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.AutoRotate = true
+		end
+	end
+
+	currentTilt = 0
+	currentPitch = 0
+end
+
+------------------------------------------------------------
+-- GAME ZONE DETECTION (ZonePlus)
+-- Finds ALL Parts named "GameZone" in Workspace.
+-- Each should have a string Attribute "Rarity" (Common, Uncommon, etc.)
+-- Entering any zone → morph. Leaving all zones → unmorph.
+------------------------------------------------------------
+local activeZones = {} -- Track which zones we're currently inside: [zonePart] = rarity
+local trackedZones = {} -- [zonePart] = true, so we don't double-track
+
+-- Forward declaration (defined after UI creation)
+local updateZoneLabel
+
+local function trackZonePart(zonePart)
+	if trackedZones[zonePart] then return end
+	trackedZones[zonePart] = true
+
+	local rarity = zonePart:GetAttribute("Rarity") or "Common"
+	local zone = Zone.new(zonePart)
+
+	zone.playerEntered:Connect(function(enteringPlayer)
+		if enteringPlayer == Player then
+			activeZones[zonePart] = rarity
+			ZoneChanged:FireServer(true, rarity)
+			updateZoneLabel()
+		end
+	end)
+
+	zone.playerExited:Connect(function(exitingPlayer)
+		if exitingPlayer == Player then
+			activeZones[zonePart] = nil
+
+			-- Check if still in any other zone
+			local stillInZone = false
+			local currentRarity = nil
+			for _, r in activeZones do
+				stillInZone = true
+				currentRarity = r
+				break
+			end
+
+			if stillInZone then
+				ZoneChanged:FireServer(true, currentRarity)
+			else
+				ZoneChanged:FireServer(false, nil)
+			end
+			updateZoneLabel()
+		end
+	end)
+end
+
+local function setupZoneDetection()
+	-- Track any GameZone parts already in workspace
+	for _, obj in workspace:GetDescendants() do
+		if obj:IsA("BasePart") and obj.Name == "GameZone" then
+			trackZonePart(obj)
+		end
+	end
+
+	-- Also track GameZone parts that get added later (streaming / dynamic)
+	workspace.DescendantAdded:Connect(function(obj)
+		if obj:IsA("BasePart") and obj.Name == "GameZone" then
+			trackZonePart(obj)
+		end
+	end)
+
+	local count = 0
+	for _ in trackedZones do count += 1 end
+
+	if count == 0 then
+		-- Nothing found yet — wait a bit and retry once
+		task.delay(5, function()
+			for _, obj in workspace:GetDescendants() do
+				if obj:IsA("BasePart") and obj.Name == "GameZone" then
+					trackZonePart(obj)
+				end
+			end
+
+			local retryCount = 0
+			for _ in trackedZones do retryCount += 1 end
+			if retryCount == 0 then
+				warn("[DriveClient] No GameZone parts found in Workspace after retry!")
+			else
+				print("[DriveClient] Found " .. retryCount .. " GameZone(s) on retry")
+			end
+		end)
+	else
+		print("[DriveClient] Tracking " .. count .. " GameZone(s)")
+	end
+end
+
+------------------------------------------------------------
+-- WHEEL SPIN ANIMATION
+-- Your SmallTruck wheels: Wheels/Tire1/(Tire1, ATire1), etc.
+-- Each tire meshpart has a "WheelWeld" connecting it to DriveSeat.
+-- We spin the weld's C1 to rotate the wheel visually.
+--
+-- SPIN AXIS: Depending on how the mesh was modeled, the correct
+-- rotation axis may be X, Y, or Z. We default to X (forward roll).
+-- If wheels spin the wrong way, change WHEEL_SPIN_AXIS below.
+------------------------------------------------------------
+local WHEEL_SPIN_AXIS = "Z" -- Matches the tire orientation on the SmallTruck model
+local WHEEL_SPIN_SPEED = 4  -- Visual multiplier (higher = faster spinning)
+
+local function startWheelSpin()
+	if wheelSpinConnection then return end
+
+	wheelSpinConnection = RunService.RenderStepped:Connect(function(dt)
+		local character = Player.Character
+		if not character then return end
+
+		local rootPart = character:FindFirstChild("HumanoidRootPart")
+		if not rootPart then return end
+
+		local truck = character:FindFirstChild("ActiveTruck")
+		if not truck then return end
+
+		local wheelsFolder = truck:FindFirstChild("Wheels")
+		if not wheelsFolder then return end
+
+		local speed = rootPart.AssemblyLinearVelocity.Magnitude
+
+		if speed > 0.5 then
+			local spinAmount = speed * dt * WHEEL_SPIN_SPEED
+
+			-- Build the rotation CFrame based on chosen axis
+			local spinCF
+			if WHEEL_SPIN_AXIS == "X" then
+				spinCF = CFrame.Angles(spinAmount, 0, 0)
+			elseif WHEEL_SPIN_AXIS == "Y" then
+				spinCF = CFrame.Angles(0, spinAmount, 0)
+			else
+				spinCF = CFrame.Angles(0, 0, spinAmount)
+			end
+
+			for _, tireModel in wheelsFolder:GetChildren() do
+				if tireModel:IsA("Model") then
+					for _, part in tireModel:GetChildren() do
+						if part:IsA("BasePart") then
+							-- Look for WheelWeld (from server) or TruckWeld (fallback)
+							local weld = part:FindFirstChild("WheelWeld") 
+								or part:FindFirstChild("TruckWeld")
+							if weld then
+								weld.C1 = weld.C1 * spinCF
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+local function stopWheelSpin()
+	if wheelSpinConnection then
+		wheelSpinConnection:Disconnect()
+		wheelSpinConnection = nil
+	end
+end
+
+------------------------------------------------------------
+-- UI: FUEL BAR + ZONE INDICATOR
+------------------------------------------------------------
+local screenGui, fuelFrame, fuelBar, fuelLabel, zoneLabel
+
+local function createUI()
+	screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "DriveHUD"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.Parent = Player.PlayerGui
+
+	-- Fuel bar container (top center)
+	fuelFrame = Instance.new("Frame")
+	fuelFrame.Name = "FuelFrame"
+	fuelFrame.Size = UDim2.new(0, 280, 0, 28)
+	fuelFrame.Position = UDim2.new(0.5, -140, 0, 12)
+	fuelFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+	fuelFrame.BorderSizePixel = 0
+	fuelFrame.Visible = false
+	fuelFrame.Parent = screenGui
+
+	local fuelCorner = Instance.new("UICorner")
+	fuelCorner.CornerRadius = UDim.new(0, 8)
+	fuelCorner.Parent = fuelFrame
+
+	local fuelStroke = Instance.new("UIStroke")
+	fuelStroke.Thickness = 1.5
+	fuelStroke.Color = Color3.fromRGB(80, 80, 100)
+	fuelStroke.Parent = fuelFrame
+
+	-- Fuel fill bar
+	fuelBar = Instance.new("Frame")
+	fuelBar.Name = "FuelFill"
+	fuelBar.Size = UDim2.new(1, -6, 1, -6)
+	fuelBar.Position = UDim2.new(0, 3, 0, 3)
+	fuelBar.BackgroundColor3 = Color3.fromRGB(255, 170, 0)
+	fuelBar.BorderSizePixel = 0
+	fuelBar.Parent = fuelFrame
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(0, 6)
+	fillCorner.Parent = fuelBar
+
+	-- Fuel text
+	fuelLabel = Instance.new("TextLabel")
+	fuelLabel.Name = "FuelText"
+	fuelLabel.Size = UDim2.new(1, 0, 1, 0)
+	fuelLabel.BackgroundTransparency = 1
+	fuelLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	fuelLabel.Text = "FUEL: 50/50"
+	fuelLabel.TextSize = 13
+	fuelLabel.Font = Enum.Font.GothamBold
+	fuelLabel.ZIndex = 5
+	fuelLabel.Parent = fuelFrame
+
+	-- Zone status indicator (below fuel bar)
+	zoneLabel = Instance.new("TextLabel")
+	zoneLabel.Name = "ZoneStatus"
+	zoneLabel.Size = UDim2.new(0, 220, 0, 22)
+	zoneLabel.Position = UDim2.new(0.5, -110, 0, 44)
+	zoneLabel.BackgroundTransparency = 1
+	zoneLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
+	zoneLabel.Text = ""
+	zoneLabel.TextSize = 12
+	zoneLabel.Font = Enum.Font.GothamMedium
+	zoneLabel.Visible = false
+	zoneLabel.Parent = screenGui
+end
+
+local function updateFuelUI(fuel, max)
+	if not fuelFrame then return end
+
+	currentFuel = fuel
+	maxFuel = max
+
+	fuelFrame.Visible = isMorphed
+	fuelLabel.Text = string.format("FUEL: %d / %d", math.floor(fuel), max)
+
+	local pct = math.clamp(fuel / max, 0, 1)
+
+	-- Tween the fill bar width
+	TweenService:Create(fuelBar, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+		Size = UDim2.new(pct, -6 + (6 * (1 - pct)), 1, -6)
+	}):Play()
+
+	-- Color based on fuel level
+	if pct > 0.5 then
+		fuelBar.BackgroundColor3 = Color3.fromRGB(80, 210, 80)
+	elseif pct > 0.2 then
+		fuelBar.BackgroundColor3 = Color3.fromRGB(255, 180, 30)
+	else
+		fuelBar.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+	end
+end
+
+updateZoneLabel = function()
+	if not zoneLabel then return end
+
+	zoneLabel.Visible = isMorphed
+
+	if isMorphed then
+		-- Check if in any zone
+		local currentRarity = nil
+		for _, r in activeZones do
+			currentRarity = r
+			break
+		end
+
+		if currentRarity then
+			zoneLabel.Text = currentRarity:upper() .. " ZONE — Fuel draining"
+			zoneLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+		else
+			zoneLabel.Text = "SAFE ZONE — Fuel paused"
+			zoneLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
+		end
+	end
+end
+
+------------------------------------------------------------
+-- EVENT HANDLERS
+------------------------------------------------------------
+MorphEvent.OnClientEvent:Connect(function()
+	isMorphed = true
+	startWheelSpin()
+	startDriveController()
+	updateZoneLabel()
+
+	if fuelFrame then
+		fuelFrame.Visible = true
+	end
+end)
+
+UnmorphEvent.OnClientEvent:Connect(function()
+	isMorphed = false
+	stopWheelSpin()
+	stopDriveController()
+	updateZoneLabel()
+
+	if fuelFrame then
+		fuelFrame.Visible = false
+	end
+	if zoneLabel then
+		zoneLabel.Visible = false
+	end
+end)
+
+FuelUpdate.OnClientEvent:Connect(function(fuel, max)
+	updateFuelUI(fuel, max)
+end)
+
+------------------------------------------------------------
+-- HANDLE RESPAWN
+------------------------------------------------------------
+Player.CharacterAdded:Connect(function()
+	isMorphed = false
+	activeZones = {}
+	stopWheelSpin()
+	stopDriveController()
+
+	if fuelFrame then
+		fuelFrame.Visible = false
+	end
+	if zoneLabel then
+		zoneLabel.Visible = false
+	end
+end)
+
+------------------------------------------------------------
+-- INIT
+------------------------------------------------------------
+createUI()
+setupZoneDetection()
+
+print("[DriveClient] Loaded!")
+---
+
+--- StarterPlayer.StarterPlayerScripts.PickupClient (LocalScript) ---
+--[[
+	StarterPlayer/StarterPlayerScripts/PickupClient.lua (LocalScript)
+	
+	SOLE RESPONSIBILITY: Listen for ProximityPrompt "PickupPrompt" triggers
+	on world brainrots, fire PickupBrainrot remote.
+	
+	Each world brainrot model needs:
+	- Attribute "BrainrotId" (string) e.g. "67"
+	- Attribute "Rarity" (string) e.g. "Common"
+	- A ProximityPrompt named "PickupPrompt" inside any child part
+--]]
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local PickupRemote = Remotes:WaitForChild("PickupBrainrot")
+
+------------------------------------------------------------
+-- HELPERS
+------------------------------------------------------------
+local function findBrainrotAncestor(inst: Instance): Model?
+	local current = inst
+	while current and current ~= workspace do
+		if current:IsA("Model") and current:GetAttribute("BrainrotId") then
+			return current :: Model
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+------------------------------------------------------------
+-- WIRE PROXIMITY PROMPTS
+------------------------------------------------------------
+local wiredPrompts = {}
+
+local function wirePrompt(prompt: ProximityPrompt)
+	if wiredPrompts[prompt] then return end
+	wiredPrompts[prompt] = true
+
+	prompt.Triggered:Connect(function(triggeringPlayer: Player)
+		if triggeringPlayer ~= player then return end
+
+		local brainrotModel = findBrainrotAncestor(prompt)
+		if not brainrotModel then return end
+
+		PickupRemote:FireServer(brainrotModel)
+	end)
+end
+
+local function isPickupPrompt(inst: Instance): boolean
+	return inst:IsA("ProximityPrompt") and inst.Name == "PickupPrompt"
+end
+
+-- Wire existing
+for _, desc in workspace:GetDescendants() do
+	if isPickupPrompt(desc) then
+		wirePrompt(desc :: ProximityPrompt)
+	end
+end
+
+-- Wire future (spawned brainrots, streaming)
+workspace.DescendantAdded:Connect(function(desc)
+	if isPickupPrompt(desc) then
+		wirePrompt(desc :: ProximityPrompt)
+	end
+end)
+
+-- Cleanup
+workspace.DescendantRemoving:Connect(function(desc)
+	if wiredPrompts[desc] then
+		wiredPrompts[desc] = nil
+	end
+end)
+---
+
+--- StarterPlayer.StarterPlayerScripts.PlacementClient (LocalScript) ---
+--[[
+	StarterPlayer/StarterPlayerScripts/PlacementClient.lua (LocalScript)
+	
+	SOLE RESPONSIBILITY: Stand interactions — ProximityPrompt to place/remove,
+	click Buy button to upgrade. Auto-selects brainrot from equipped Tool.
+--]]
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local PlaceRemote = Remotes:WaitForChild("PlaceBrainrot")
+local RemoveRemote = Remotes:WaitForChild("RemoveFromStand")
+local UpgradeRemote = Remotes:WaitForChild("UpgradeBrainrot")
+
+local selectedBrainrotUUID: string? = nil
+local selectedBrainrotName: string? = nil
+
+------------------------------------------------------------
+-- AUTO-SELECT FROM EQUIPPED TOOL
+------------------------------------------------------------
+local function onCharacterAdded(character: Model)
+	character.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") and child:GetAttribute("BrainrotUUID") then
+			selectedBrainrotUUID = child:GetAttribute("BrainrotUUID")
+			selectedBrainrotName = child.Name
+		end
+	end)
+
+	character.ChildRemoved:Connect(function(child)
+		if child:IsA("Tool") and child:GetAttribute("BrainrotUUID") then
+			if selectedBrainrotUUID == child:GetAttribute("BrainrotUUID") then
+				selectedBrainrotUUID = nil
+				selectedBrainrotName = nil
+			end
+		end
+	end)
+
+	for _, child in character:GetChildren() do
+		if child:IsA("Tool") and child:GetAttribute("BrainrotUUID") then
+			selectedBrainrotUUID = child:GetAttribute("BrainrotUUID")
+			selectedBrainrotName = child.Name
+		end
+	end
+end
+
+player.CharacterAdded:Connect(onCharacterAdded)
+if player.Character then
+	onCharacterAdded(player.Character)
+end
+
+------------------------------------------------------------
+-- STAND STATE TRACKING
+------------------------------------------------------------
+local function standHasBrainrot(platform: BasePart): boolean
+	for _, child in platform:GetChildren() do
+		if child.Name == "BrainrotVisual" then
+			return true
+		end
+	end
+	return false
+end
+
+------------------------------------------------------------
+-- CONTROL CENTER VISIBILITY
+-- Part is always invisible but clickable, only SurfaceGui toggles
+------------------------------------------------------------
+local function updateControlCenter(standModel: Model, hasBrainrot: boolean)
+	local stand = standModel:FindFirstChild("Stand")
+	if not stand then return end
+
+	local cc = stand:FindFirstChild("ControlCenter")
+	if not cc then return end
+
+	local gui = cc:FindFirstChild("SurfaceGui")
+	if gui then
+		gui.Enabled = hasBrainrot
+	end
+end
+
+------------------------------------------------------------
+-- STAND WIRING
+------------------------------------------------------------
+local wiredStands = {}
+
+local function wireStand(standModel: Model, standKey: string, platform: BasePart)
+	if wiredStands[standKey] then return end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "StandPrompt"
+	prompt.HoldDuration = 0.5
+	prompt.MaxActivationDistance = 10
+	prompt.ActionText = "Place"
+	prompt.ObjectText = ""
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = platform
+
+	wiredStands[standKey] = {
+		prompt = prompt,
+		standModel = standModel,
+		platform = platform,
+	}
+
+	-- Set initial ControlCenter visibility
+	local hasBrainrot = standHasBrainrot(platform)
+	updateControlCenter(standModel, hasBrainrot)
+
+	-- Watch for BrainrotVisual being added/removed
+	platform.ChildAdded:Connect(function(child)
+		if child.Name == "BrainrotVisual" then
+			updateControlCenter(standModel, true)
+		end
+	end)
+
+	platform.ChildRemoved:Connect(function(child)
+		if child.Name == "BrainrotVisual" then
+			updateControlCenter(standModel, false)
+		end
+	end)
+
+	-- Update prompt text dynamically
+	prompt.PromptShown:Connect(function()
+		local occupied = standHasBrainrot(platform)
+		if occupied then
+			prompt.ActionText = "Pick Up"
+			prompt.ObjectText = ""
+		elseif selectedBrainrotUUID then
+			prompt.ActionText = "Place"
+			prompt.ObjectText = selectedBrainrotName or "Brainrot"
+		else
+			prompt.ActionText = "Place"
+			prompt.ObjectText = "No brainrot held"
+		end
+	end)
+
+	-- Handle trigger
+	prompt.Triggered:Connect(function(triggeringPlayer: Player)
+		if triggeringPlayer ~= player then return end
+
+		local occupied = standHasBrainrot(platform)
+
+		if occupied then
+			RemoveRemote:FireServer(standKey)
+		elseif selectedBrainrotUUID then
+			PlaceRemote:FireServer(selectedBrainrotUUID, standKey)
+			selectedBrainrotUUID = nil
+			selectedBrainrotName = nil
+		end
+	end)
+end
+
+------------------------------------------------------------
+-- WIRE UPGRADE BUTTONS
+------------------------------------------------------------
+local function wireUpgradeButton(buyButton: ImageButton, standKey: string)
+	buyButton.MouseButton1Click:Connect(function()
+		UpgradeRemote:FireServer(standKey)
+	end)
+end
+
+------------------------------------------------------------
+-- WIRE ALL STANDS ON ASSIGNED PLOT
+------------------------------------------------------------
+local function wirePlotStands()
+	print("[PlacementClient] Waiting for AssignedPlot...")
+
+	local plotName = player:GetAttribute("AssignedPlot")
+	if not plotName then
+		player:GetAttributeChangedSignal("AssignedPlot"):Wait()
+		plotName = player:GetAttribute("AssignedPlot")
+	end
+
+	print("[PlacementClient] Got plot:", plotName)
+
+	local plots = workspace:WaitForChild("World"):WaitForChild("Plots")
+	local plot = plots:WaitForChild(plotName)
+	local floors = plot:WaitForChild("Floors")
+
+	task.wait(2)
+
+	local count = 0
+
+	for _, floor in floors:GetChildren() do
+		local stands = floor:WaitForChild("Stands", 10)
+		if not stands then
+			warn("[PlacementClient] No Stands folder in floor", floor.Name)
+			continue
+		end
+
+		task.wait(0.5)
+
+		for _, standModel in stands:GetChildren() do
+			if not standModel:IsA("Model") then continue end
+
+			local key = floor.Name .. "_" .. standModel.Name
+
+			local stand = standModel:WaitForChild("Stand", 5)
+			if not stand then
+				warn("[PlacementClient] No Stand in", standModel:GetFullName())
+				continue
+			end
+
+			local platform = stand:WaitForChild("Platform", 5)
+			if not platform then
+				warn("[PlacementClient] No Platform in", stand:GetFullName())
+				continue
+			end
+
+			-- Hide ControlCenter part but keep it clickable
+			local cc = stand:FindFirstChild("ControlCenter")
+			if cc and cc:IsA("BasePart") then
+				cc.Transparency = 1
+				cc.CanQuery = true
+			end
+
+			-- Setup SurfaceGui
+			if cc then
+				local gui = cc:FindFirstChild("SurfaceGui")
+				if gui then
+					gui.Active = true
+					gui.Enabled = false -- hidden until brainrot placed
+
+					-- Wire upgrade button
+					local upgrade = gui:FindFirstChild("Upgrade")
+					if upgrade then
+						local buy = upgrade:FindFirstChild("Buy")
+						if buy then
+							wireUpgradeButton(buy, key)
+						end
+					end
+				end
+			end
+
+			-- Create ProximityPrompt
+			wireStand(standModel, key, platform)
+
+			count += 1
+		end
+	end
+
+	print("[PlacementClient] Wired", count, "stands")
+end
+
+task.spawn(wirePlotStands)
+---

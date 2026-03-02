@@ -3382,10 +3382,17 @@ return PickupController
 	
 	SOLE RESPONSIBILITY: Place/remove brainrots on stands, upgrade level.
 	Destroys the backpack Tool on place, recreates on remove.
+	
+	FIXES:
+	- Brainrots centered using bounding box (dead center on platform + 0.5 Y offset)
+	- Stands 1–5: orientation (0, 0, 0) / Stands 6–10: orientation (0, 180, 0)
+	- Upgrade: $$$ VFX on brainrot, B - Hit 02 on ControlCenter, brainrot jumps
 --]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
+local ServerStorage = game:GetService("ServerStorage")
+local TweenService = game:GetService("TweenService")
 
 local PlayerManager = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("PlayerManager"))
 local InventoryController = require(ServerScriptService:WaitForChild("Services"):WaitForChild("InventoryService"):WaitForChild("InventoryController"))
@@ -3410,16 +3417,21 @@ UpgradeRemote.Name = "UpgradeBrainrot"
 UpgradeRemote.Parent = Remotes
 
 ------------------------------------------------------------
+-- VFX TEMPLATES (from ServerStorage)
+------------------------------------------------------------
+local VfxFolder = ServerStorage:WaitForChild("Vfx")
+local MoneyVfxTemplate = VfxFolder:WaitForChild("$$$")
+local HitVfxTemplate = VfxFolder:WaitForChild("B - Hit 02")
+
+------------------------------------------------------------
 -- TOOL HELPERS
 ------------------------------------------------------------
 local function findToolByUUID(player: Player, uuid: string): Tool?
-	-- Check backpack
 	for _, child in player.Backpack:GetChildren() do
 		if child:IsA("Tool") and child:GetAttribute("BrainrotUUID") == uuid then
 			return child
 		end
 	end
-	-- Check character (if equipped)
 	local char = player.Character
 	if char then
 		for _, child in char:GetChildren() do
@@ -3483,6 +3495,194 @@ function PlacementController.GetStandModel(player: Player, standKey: string): Mo
 	return stands:FindFirstChild(tostring(standNum))
 end
 
+------------------------------------------------------------
+-- ORIENTATION HELPER
+-- Stands 1-5: face forward (0, 0, 0)
+-- Stands 6-10: face backward (0, 180, 0)
+------------------------------------------------------------
+local function getStandRotation(standKey: string): CFrame
+	local _, standNumStr = standKey:match("^(%d+)_(%d+)$")
+	local standNum = tonumber(standNumStr) or 1
+
+	if standNum >= 6 and standNum <= 10 then
+		return CFrame.Angles(0, math.rad(180), 0)
+	end
+	return CFrame.Angles(0, 0, 0)
+end
+
+------------------------------------------------------------
+-- CENTERING HELPER
+-- Uses GetBoundingBox to find the model's true geometric center,
+-- then places the bottom-center of that bounding box dead-center
+-- on the platform top surface + 0.5 stud offset.
+------------------------------------------------------------
+local EXTRA_Y_OFFSET = 0.5
+
+local function getCenteredCFrame(visual: Instance, platformCF: CFrame, platformSize: Vector3, standKey: string)
+	local rotation = getStandRotation(standKey)
+
+	-- Top surface of platform + extra offset, with stand rotation baked into world space
+	local topOfPlatform = platformCF * CFrame.new(0, platformSize.Y / 2 + EXTRA_Y_OFFSET, 0) * rotation
+
+	if visual:IsA("Model") then
+		-- Ensure PrimaryPart exists for PivotTo
+		if not visual.PrimaryPart then
+			local mainPart = visual:FindFirstChildWhichIsA("BasePart")
+			if mainPart then
+				visual.PrimaryPart = mainPart
+			end
+		end
+
+		-- GetBoundingBox gives us the center CFrame and size of the axis-aligned bounding box
+		local boundsCF, boundsSize = visual:GetBoundingBox()
+
+		-- We want the bottom-center of the bounding box to sit at topOfPlatform
+		-- Bottom of bbox = center - halfHeight
+		local halfHeight = boundsSize.Y / 2
+
+		-- So the bbox center needs to be at topOfPlatform shifted up by halfHeight
+		local targetBoundsCenter = topOfPlatform * CFrame.new(0, halfHeight, 0)
+
+		-- Compute the offset from the model's pivot to the bounding box center
+		local pivotCF = visual:GetPivot()
+		local pivotToBounds = pivotCF:ToObjectSpace(boundsCF)
+
+		-- Invert that offset: we know where the bbox center should go,
+		-- so the pivot needs to be shifted by the inverse
+		local targetPivot = targetBoundsCenter * pivotToBounds:Inverse()
+
+		return targetPivot
+
+	elseif visual:IsA("BasePart") then
+		local halfHeight = visual.Size.Y / 2
+		return topOfPlatform * CFrame.new(0, halfHeight, 0)
+	end
+
+	return topOfPlatform
+end
+
+------------------------------------------------------------
+-- VFX HELPER
+-- Clones a VFX template, parents its attachment to a target part,
+-- reads attributes (EmitDuration, EmitCount, EmitDelay) from each
+-- ParticleEmitter, emits accordingly, then cleans up.
+------------------------------------------------------------
+local function playVfx(vfxTemplate: BasePart, targetPart: BasePart)
+	local vfxClone = vfxTemplate:Clone()
+
+	local attachment = vfxClone:FindFirstChildWhichIsA("Attachment")
+	if not attachment then
+		vfxClone:Destroy()
+		return
+	end
+
+	-- Reparent the attachment to the target part
+	attachment.Parent = targetPart
+
+	-- All emitters start disabled
+	local emitters = {}
+	for _, child in attachment:GetDescendants() do
+		if child:IsA("ParticleEmitter") then
+			child.Enabled = false
+			table.insert(emitters, child)
+		end
+	end
+
+	local maxLifetime = 0
+
+	for _, emitter in emitters do
+		local emitDelay = emitter:GetAttribute("EmitDelay") or 0
+		local emitDuration = emitter:GetAttribute("EmitDuration") or 0.2
+		local emitCount = emitter:GetAttribute("EmitCount") or 0
+
+		local emitterLifetime = emitDelay + emitDuration + 2
+		if emitterLifetime > maxLifetime then
+			maxLifetime = emitterLifetime
+		end
+
+		task.spawn(function()
+			if emitDelay > 0 then
+				task.wait(emitDelay)
+			end
+
+			if emitCount > 0 then
+				emitter:Emit(emitCount)
+			end
+
+			emitter.Enabled = true
+			task.wait(emitDuration)
+			emitter.Enabled = false
+		end)
+	end
+
+	task.delay(maxLifetime, function()
+		if attachment and attachment.Parent then
+			attachment:Destroy()
+		end
+		vfxClone:Destroy()
+	end)
+end
+
+------------------------------------------------------------
+-- JUMP ANIMATION FOR BRAINROT VISUAL
+------------------------------------------------------------
+local JUMP_HEIGHT = 3
+local JUMP_UP_TIME = 0.2
+local JUMP_DOWN_TIME = 0.25
+
+local function playJumpAnimation(visual: Instance, restCF: CFrame)
+	local jumpUpCF = restCF * CFrame.new(0, JUMP_HEIGHT, 0)
+
+	if visual:IsA("Model") then
+		if not visual.PrimaryPart then
+			local mainPart = visual:FindFirstChildWhichIsA("BasePart")
+			if mainPart then
+				visual.PrimaryPart = mainPart
+			else
+				return
+			end
+		end
+
+		-- Compute the PrimaryPart CFrame that corresponds to the pivot being at restCF / jumpUpCF
+		local currentPivot = visual:GetPivot()
+		local primaryCF = visual.PrimaryPart.CFrame
+		local pivotToPrimary = currentPivot:ToObjectSpace(primaryCF)
+
+		local primaryUpCF = jumpUpCF * pivotToPrimary
+		local primaryDownCF = restCF * pivotToPrimary
+
+		local upTween = TweenService:Create(visual.PrimaryPart, TweenInfo.new(
+			JUMP_UP_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
+		), { CFrame = primaryUpCF })
+
+		local downTween = TweenService:Create(visual.PrimaryPart, TweenInfo.new(
+			JUMP_DOWN_TIME, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out
+		), { CFrame = primaryDownCF })
+
+		upTween:Play()
+		upTween.Completed:Once(function()
+			downTween:Play()
+		end)
+
+	elseif visual:IsA("BasePart") then
+		local upTween = TweenService:Create(visual, TweenInfo.new(
+			JUMP_UP_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
+		), { CFrame = jumpUpCF })
+
+		local downTween = TweenService:Create(visual, TweenInfo.new(
+			JUMP_DOWN_TIME, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out
+		), { CFrame = restCF })
+
+		upTween:Play()
+		upTween.Completed:Once(function()
+			downTween:Play()
+		end)
+	end
+end
+
+------------------------------------------------------------
+-- SPAWN VISUAL (centered via bounding box + oriented)
+------------------------------------------------------------
 function PlacementController.SpawnVisual(player: Player, standKey: string, brainrotData: { [string]: any })
 	local standModel = PlacementController.GetStandModel(player, standKey)
 	if not standModel then return end
@@ -3519,22 +3719,15 @@ function PlacementController.SpawnVisual(player: Player, standKey: string, brain
 		end
 	end
 
-	-- Target position: on top of the platform
-	local targetCF = platform.CFrame * CFrame.new(0, platform.Size.Y / 2 + 1, 0)
-
-	-- Parent FIRST, then move — prevents it from staying at origin
+	-- Parent FIRST so GetBoundingBox works (model must be in DataModel)
 	visual.Parent = platform
+
+	-- Compute the dead-center + oriented CFrame using bounding box
+	local targetCF = getCenteredCFrame(visual, platform.CFrame, platform.Size, standKey)
 
 	if visual:IsA("Model") then
 		if visual.PrimaryPart then
 			visual:PivotTo(targetCF)
-		else
-			-- No PrimaryPart — find one and set it
-			local mainPart = visual:FindFirstChildWhichIsA("BasePart")
-			if mainPart then
-				visual.PrimaryPart = mainPart
-				visual:PivotTo(targetCF)
-			end
 		end
 	elseif visual:IsA("BasePart") then
 		visual.CFrame = targetCF
@@ -3556,6 +3749,9 @@ function PlacementController.ClearVisual(player: Player, standKey: string)
 	end
 end
 
+------------------------------------------------------------
+-- REFRESH STAND GUI
+------------------------------------------------------------
 function PlacementController.RefreshStandGUI(player: Player, standKey: string, brainrotData: { [string]: any }?)
 	local standModel = PlacementController.GetStandModel(player, standKey)
 	if not standModel then return end
@@ -3595,6 +3791,51 @@ function PlacementController.RefreshStandGUI(player: Player, standKey: string, b
 end
 
 ------------------------------------------------------------
+-- UPGRADE EFFECTS
+-- $$$ money VFX  → on the brainrot
+-- B - Hit 02     → on the ControlCenter (upgrade GUI area)
+-- Brainrot jumps
+------------------------------------------------------------
+function PlacementController.PlayUpgradeEffects(player: Player, standKey: string)
+	local standModel = PlacementController.GetStandModel(player, standKey)
+	if not standModel then return end
+
+	local stand = standModel:FindFirstChild("Stand")
+	if not stand then return end
+
+	local platform = stand:FindFirstChild("Platform")
+	if not platform then return end
+
+	local cc = stand:FindFirstChild("ControlCenter")
+	local visual = platform:FindFirstChild("BrainrotVisual")
+	if not visual then return end
+
+	-- Find the brainrot part for money VFX + jump
+	local brainrotPart: BasePart = nil
+	if visual:IsA("Model") then
+		brainrotPart = visual.PrimaryPart or visual:FindFirstChildWhichIsA("BasePart")
+	elseif visual:IsA("BasePart") then
+		brainrotPart = visual
+	end
+
+	-- $$$ money VFX on the brainrot
+	if brainrotPart then
+		playVfx(MoneyVfxTemplate, brainrotPart)
+	end
+
+	-- B - Hit 02 on the ControlCenter part (where the upgrade button is)
+	if cc and cc:IsA("BasePart") then
+		playVfx(HitVfxTemplate, cc)
+	end
+
+	-- Jump animation on the brainrot
+	if brainrotPart then
+		local restCF = getCenteredCFrame(visual, platform.CFrame, platform.Size, standKey)
+		playJumpAnimation(visual, restCF)
+	end
+end
+
+------------------------------------------------------------
 -- INTERNAL
 ------------------------------------------------------------
 local function isStandOccupied(brainrots: { [string]: any }, standKey: string): boolean
@@ -3620,7 +3861,6 @@ PlaceRemote.OnServerEvent:Connect(function(player: Player, brainrotUUID: string,
 
 	brainrot.PlacedStand = standKey
 
-	-- Destroy the Tool from backpack/character
 	local tool = findToolByUUID(player, brainrotUUID)
 	if tool then tool:Destroy() end
 
@@ -3642,7 +3882,6 @@ RemoveRemote.OnServerEvent:Connect(function(player: Player, standKey: string)
 		if b.PlacedStand == standKey then
 			b.PlacedStand = nil
 
-			-- Recreate the Tool in backpack
 			createBrainrotTool(player, uuid, b.Id, b.Rarity)
 
 			PlacementController.ClearVisual(player, standKey)
@@ -3680,6 +3919,9 @@ UpgradeRemote.OnServerEvent:Connect(function(player: Player, standKey: string)
 
 	PlacementController.RefreshStandGUI(player, standKey, targetBrainrot)
 	InventoryController.SendUpdate(player)
+
+	-- Play upgrade effects (money VFX on brainrot, hit VFX on upgrade GUI, jump)
+	PlacementController.PlayUpgradeEffects(player, standKey)
 end)
 
 function PlacementController.Init() end
@@ -3890,10 +4132,14 @@ return InventoryController
 	
 	SOLE RESPONSIBILITY: Placed brainrots generate money per second.
 	Updates the stand Button Cash label and the BrainrotVisual billboard.
+	
+	FIX: Added .Touched collection on the Touch part so players can
+	     walk over the button to collect, in addition to ClickDetector.
 --]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local PlayerManager = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("PlayerManager"))
@@ -4001,11 +4247,127 @@ local function updateBillboard(player: Player, standKey: string, brainrotData: {
 end
 
 ------------------------------------------------------------
--- COLLECT BUTTON (Touch part)
--- When player touches/clicks the Button, collect accumulated money
+-- BUTTON PRESS ANIMATION
+-- Dips the Touch part down then tweens it back up
+------------------------------------------------------------
+local PRESS_DEPTH = 0.35       -- studs to push down
+local PRESS_DOWN_TIME = 0.08   -- seconds (fast snap down)
+local PRESS_UP_TIME = 0.15     -- seconds (slightly slower return)
+
+local originalPositions = {}   -- [touch part] = original CFrame
+local animatingButtons = {}    -- [touch part] = true (prevent overlapping anims)
+
+local function playPressAnimation(touch: BasePart)
+	if animatingButtons[touch] then return end
+	animatingButtons[touch] = true
+
+	-- Cache the original position on first press
+	if not originalPositions[touch] then
+		originalPositions[touch] = touch.CFrame
+	end
+
+	local originCF = originalPositions[touch]
+	local pressedCF = originCF - Vector3.new(0, PRESS_DEPTH, 0)
+
+	-- Snap down
+	local tweenDown = TweenService:Create(touch, TweenInfo.new(
+		PRESS_DOWN_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
+		), { CFrame = pressedCF })
+
+	-- Bounce back up
+	local tweenUp = TweenService:Create(touch, TweenInfo.new(
+		PRESS_UP_TIME, Enum.EasingStyle.Back, Enum.EasingDirection.Out
+		), { CFrame = originCF })
+
+	tweenDown:Play()
+	tweenDown.Completed:Once(function()
+		tweenUp:Play()
+		tweenUp.Completed:Once(function()
+			animatingButtons[touch] = nil
+		end)
+	end)
+end
+
+------------------------------------------------------------
+-- COLLECT LOGIC (shared by both Touched and ClickDetector)
 ------------------------------------------------------------
 local collectCooldowns = {} -- [player_standKey] = tick
 
+local function doCollect(player: Player, standKey: string)
+	local cooldownKey = player.UserId .. "_" .. standKey
+	local now = tick()
+	if collectCooldowns[cooldownKey] and (now - collectCooldowns[cooldownKey]) < 0.5 then
+		return -- cooldown
+	end
+	collectCooldowns[cooldownKey] = now
+
+	local data = PlayerManager.GetData(player)
+	if not data then return end
+
+	-- Find the brainrot on this stand
+	local brainrot = nil
+	for _, b in data.Inventory.Brainrots do
+		if b.PlacedStand == standKey then
+			brainrot = b
+			break
+		end
+	end
+	if not brainrot then return end
+
+	-- Calculate accumulated money (stored per stand)
+	local accKey = "AccumulatedMoney_" .. standKey
+	local accumulated = data[accKey] or 0
+
+	if accumulated <= 0 then return end
+
+	-- Play the button press animation
+	local standModel = getStandModel(player, standKey)
+	if standModel then
+		local button = standModel:FindFirstChild("Button")
+		if button then
+			local touchPart = button:FindFirstChild("Touch")
+			if touchPart then
+				playPressAnimation(touchPart)
+			end
+		end
+	end
+
+	-- Give money
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local moneyValue = leaderstats and leaderstats:FindFirstChild("Money")
+	if moneyValue then
+		moneyValue.Value += math.floor(accumulated)
+	end
+
+	-- Reset accumulated
+	data[accKey] = 0
+	updateCashLabel(player, standKey, 0)
+end
+
+------------------------------------------------------------
+-- HELPER: Get the player who owns a plot from a part inside it
+------------------------------------------------------------
+local function getPlotOwnerFromPart(part: BasePart): Player?
+	-- Walk up from the Touch part to find the Plot model,
+	-- then match it to the player whose plot it is.
+	local current = part.Parent
+	while current and current ~= workspace do
+		-- Check if this is a plot assigned to any player
+		for _, p in Players:GetPlayers() do
+			local plot = PlotManager.GetPlot(p)
+			if plot and current == plot then
+				return p
+			end
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+------------------------------------------------------------
+-- COLLECT BUTTON SETUP (Touch part)
+-- FIX: Now wires BOTH .Touched (walk-over) AND ClickDetector (click)
+------------------------------------------------------------
 local function setupCollectButton(player: Player, standKey: string)
 	local standModel = getStandModel(player, standKey)
 	if not standModel then return end
@@ -4016,10 +4378,16 @@ local function setupCollectButton(player: Player, standKey: string)
 	local touch = button:FindFirstChild("Touch")
 	if not touch then return end
 
-	-- Use ClickDetector for click-to-collect
+	-- Prevent double-wiring
 	local existing = touch:FindFirstChild("CollectClick")
 	if existing then return end -- already wired
 
+	-- Make sure Touch part can be touched by characters
+	touch.CanTouch = true
+
+	----------------------------------------------------
+	-- METHOD 1: ClickDetector (click-to-collect, works on desktop)
+	----------------------------------------------------
 	local click = Instance.new("ClickDetector")
 	click.Name = "CollectClick"
 	click.MaxActivationDistance = 15
@@ -4027,43 +4395,27 @@ local function setupCollectButton(player: Player, standKey: string)
 
 	click.MouseClick:Connect(function(clickPlayer: Player)
 		if clickPlayer ~= player then return end
+		doCollect(player, standKey)
+	end)
 
-		local cooldownKey = player.UserId .. "_" .. standKey
-		local now = tick()
-		if collectCooldowns[cooldownKey] and (now - collectCooldowns[cooldownKey]) < 0.5 then
-			return -- cooldown
-		end
-		collectCooldowns[cooldownKey] = now
+	----------------------------------------------------
+	-- METHOD 2: .Touched (walk-over collection, works on all platforms)
+	----------------------------------------------------
+	touch.Touched:Connect(function(hit: BasePart)
+		-- Check if the touching part belongs to a character
+		local character = hit.Parent
+		if not character then return end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if not humanoid then return end
 
-		local data = PlayerManager.GetData(player)
-		if not data then return end
+		-- Find which player this character belongs to
+		local touchPlayer = Players:GetPlayerFromCharacter(character)
+		if not touchPlayer then return end
 
-		-- Find the brainrot on this stand
-		local brainrot = nil
-		for _, b in data.Inventory.Brainrots do
-			if b.PlacedStand == standKey then
-				brainrot = b
-				break
-			end
-		end
-		if not brainrot then return end
+		-- Only the plot owner can collect
+		if touchPlayer ~= player then return end
 
-		-- Calculate accumulated money (stored per stand)
-		local accKey = "AccumulatedMoney_" .. standKey
-		local accumulated = data[accKey] or 0
-
-		if accumulated <= 0 then return end
-
-		-- Give money
-		local leaderstats = player:FindFirstChild("leaderstats")
-		local moneyValue = leaderstats and leaderstats:FindFirstChild("Money")
-		if moneyValue then
-			moneyValue.Value += math.floor(accumulated)
-		end
-
-		-- Reset accumulated
-		data[accKey] = 0
-		updateCashLabel(player, standKey, 0)
+		doCollect(player, standKey)
 	end)
 end
 

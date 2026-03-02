@@ -572,6 +572,14 @@ end)
 	
 	SOLE RESPONSIBILITY: Stand interactions — ProximityPrompt to place/remove,
 	click Buy button to upgrade. Auto-selects brainrot from equipped Tool.
+	
+	FIXES:
+	1. Upgrade button: Added ClickDetector fallback on ControlCenter part
+	   so clicking the stand's upgrade panel works reliably on all platforms.
+	2. SurfaceGui: Ensured AlwaysOnTop = false, proper Face, and
+	   MaxDistance set so raycasting works.
+	3. Buy button & parent frames: Ensured Active = true propagates
+	   correctly so mouse events fire through the SurfaceGui hierarchy.
 --]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -721,11 +729,57 @@ end
 
 ------------------------------------------------------------
 -- WIRE UPGRADE BUTTONS
+-- FIX: Multiple methods to ensure the upgrade click registers:
+--   1. SurfaceGui button MouseButton1Click (original)
+--   2. SurfaceGui button Activated (more reliable cross-platform)
+--   3. ClickDetector on the ControlCenter part (fallback for
+--      cases where SurfaceGui input doesn't propagate)
 ------------------------------------------------------------
-local function wireUpgradeButton(buyButton: ImageButton, standKey: string)
-	buyButton.MouseButton1Click:Connect(function()
+local upgradeCooldowns = {} -- [standKey] = tick
+
+local function wireUpgradeButton(buyButton: ImageButton, standKey: string, controlCenterPart: BasePart?)
+	local function doUpgrade()
+		-- Cooldown to prevent double-fires
+		local now = tick()
+		if upgradeCooldowns[standKey] and (now - upgradeCooldowns[standKey]) < 0.3 then
+			return
+		end
+		upgradeCooldowns[standKey] = now
+
 		UpgradeRemote:FireServer(standKey)
-	end)
+	end
+
+	-- Method 1: MouseButton1Click (original — works on desktop with SurfaceGui)
+	buyButton.MouseButton1Click:Connect(doUpgrade)
+
+	-- Method 2: Activated (more reliable, fires on click/tap/gamepad)
+	buyButton.Activated:Connect(doUpgrade)
+
+	-- Method 3: ClickDetector on the ControlCenter part itself
+	-- This is a reliable fallback — if the SurfaceGui isn't intercepting
+	-- mouse input, the ClickDetector on the underlying part will catch it.
+	if controlCenterPart then
+		local existingClick = controlCenterPart:FindFirstChild("UpgradeClick")
+		if not existingClick then
+			local click = Instance.new("ClickDetector")
+			click.Name = "UpgradeClick"
+			click.MaxActivationDistance = 12
+			click.Parent = controlCenterPart
+
+			click.MouseClick:Connect(function(clickPlayer: Player)
+				if clickPlayer ~= player then return end
+				-- Only upgrade if there's a brainrot on the stand
+				-- (the GUI being enabled implies a brainrot is placed)
+				local stand = controlCenterPart.Parent
+				if not stand then return end
+				local platform = stand:FindFirstChild("Platform")
+				if not platform then return end
+				if not standHasBrainrot(platform) then return end
+
+				doUpgrade()
+			end)
+		end
+	end
 end
 
 ------------------------------------------------------------
@@ -780,7 +834,8 @@ local function wirePlotStands()
 			local cc = stand:FindFirstChild("ControlCenter")
 			if cc and cc:IsA("BasePart") then
 				cc.Transparency = 1
-				cc.CanQuery = true
+				cc.CanQuery = true -- Needed for raycasting / SurfaceGui clicks
+				cc.CanCollide = false -- Don't block player movement
 			end
 
 			-- Setup SurfaceGui
@@ -790,12 +845,27 @@ local function wirePlotStands()
 					gui.Active = true
 					gui.Enabled = false -- hidden until brainrot placed
 
-					-- Wire upgrade button
+					-- FIX: Ensure the SurfaceGui has a reasonable interaction distance
+					-- Default is inf which is fine, but set it explicitly just in case
+					if gui:IsA("SurfaceGui") then
+						gui.MaxDistance = 32 -- can interact from up to 32 studs away
+					end
+
+					-- FIX: Make sure the Upgrade frame and Buy button have Active = true
+					-- so mouse events propagate through the SurfaceGui hierarchy
 					local upgrade = gui:FindFirstChild("Upgrade")
 					if upgrade then
+						if upgrade:IsA("GuiObject") then
+							upgrade.Active = true
+						end
+
 						local buy = upgrade:FindFirstChild("Buy")
 						if buy then
-							wireUpgradeButton(buy, key)
+							if buy:IsA("GuiObject") then
+								buy.Active = true
+							end
+							-- Pass the ControlCenter part for ClickDetector fallback
+							wireUpgradeButton(buy, key, cc)
 						end
 					end
 				end
@@ -812,4 +882,48 @@ local function wirePlotStands()
 end
 
 task.spawn(wirePlotStands)
+---
+
+--- StarterPlayer.StarterPlayerScripts.HUD.MoneyHud (LocalScript) ---
+--[[
+	StarterPlayer/StarterPlayerScripts/MoneyHUD.lua (LocalScript)
+	
+	Wires the FullGameGUI MoneyDisplay to the player's leaderstats.Money.
+	Updates the MoneyCount TextLabel in real-time using BrainrotConfig.FormatMoney.
+--]]
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local BrainrotConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotConfig"))
+
+------------------------------------------------------------
+-- WAIT FOR UI ELEMENTS
+------------------------------------------------------------
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local hudFrame = fullGui:WaitForChild("HUDFrame")
+local bottomLeft = hudFrame:WaitForChild("BottomLeftInfo")
+local moneyDisplay = bottomLeft:WaitForChild("MoneyDisplay")
+local moneyCount = moneyDisplay:WaitForChild("MoneyCount")
+
+------------------------------------------------------------
+-- WAIT FOR LEADERSTATS
+------------------------------------------------------------
+local leaderstats = player:WaitForChild("leaderstats")
+local moneyValue = leaderstats:WaitForChild("Money")
+
+------------------------------------------------------------
+-- UPDATE FUNCTION
+------------------------------------------------------------
+local function updateMoneyLabel()
+	moneyCount.Text = BrainrotConfig.FormatMoney(moneyValue.Value)
+end
+
+-- Set initial value
+updateMoneyLabel()
+
+-- Update whenever money changes
+moneyValue.Changed:Connect(updateMoneyLabel)
 ---

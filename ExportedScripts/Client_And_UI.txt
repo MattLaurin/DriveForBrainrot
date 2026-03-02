@@ -3,8 +3,9 @@
 	StarterPlayerScripts/DriveClient.lua (LocalScript)
 	
 	Handles:
-	- ZonePlus GameZone detection → tells server when entering/leaving
-	- Wheel spin animation (visual only, based on movement speed)
+	- GameZone + rarity subzone detection -> tells server when entering/leaving
+	- DynoZone multiplier detection (1x/3x/9x/25x/100x)
+	- Wheel spin animation (visual only, based on movement speed OR dyno idle)
 	- Fuel bar HUD
 	- Zone status indicator
 	- Listens for morph/unmorph events from server
@@ -30,7 +31,6 @@ local FuelUpdate = Remotes:WaitForChild("FuelUpdate")
 local MorphEvent = Remotes:WaitForChild("MorphEvent")
 local UnmorphEvent = Remotes:WaitForChild("UnmorphEvent")
 local ZoneChanged = Remotes:WaitForChild("ZoneChanged")
-local GetDriveData = Remotes:WaitForChild("GetDriveData")
 
 ------------------------------------------------------------
 -- STATE
@@ -42,28 +42,28 @@ local maxFuel = 50
 local wheelSpinConnection = nil
 local driveConnection = nil
 
+local activeGameRarityZones = {} -- [zonePart] = rarity
+local activeDynoZones = {} -- [zonePart] = multiplier
+local trackedZones = {} -- [zonePart] = true
+
+local lastSentInGameZone = false
+local lastSentInDynoZone = false
+local lastSentRarity = "Common"
+local lastSentDynoMult = 1
+
+local updateZoneLabel
+
 ------------------------------------------------------------
 -- CAR MOVEMENT TUNING
 ------------------------------------------------------------
 local CAR_SETTINGS = {
-	-- How fast the car rotates to face its movement direction
-	ROTATION_SPEED = 12,      -- Higher = snappier rotation, lower = smoother arc
-
-	-- Body tilt: slight lean into turns for visual feel
-	TILT_AMOUNT = 4,          -- Degrees of body roll on turns
-	TILT_SPEED = 8,           -- How fast the tilt responds
-
-	-- Nose tilt: slight pitch when accelerating/braking  
-	PITCH_AMOUNT = 2,         -- Degrees of nose pitch
-	PITCH_SPEED = 6,          -- How fast pitch responds
+	ROTATION_SPEED = 12,
+	TILT_AMOUNT = 4,
+	TILT_SPEED = 8,
+	PITCH_AMOUNT = 2,
+	PITCH_SPEED = 6,
 }
 
-------------------------------------------------------------
--- CAR MOVEMENT CONTROLLER
--- Dead simple: the Humanoid does ALL the movement normally.
--- We just rotate the RootPart to face the velocity direction
--- so the car always points where it's going.
-------------------------------------------------------------
 local currentTilt = 0
 local currentPitch = 0
 local lastYaw = 0
@@ -78,7 +78,6 @@ local function startDriveController()
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
 	if not humanoid or not rootPart then return end
 
-	-- We handle rotation ourselves
 	humanoid.AutoRotate = false
 
 	lastYaw = math.atan2(-rootPart.CFrame.LookVector.X, -rootPart.CFrame.LookVector.Z)
@@ -100,33 +99,26 @@ local function startDriveController()
 		local flatVel = Vector3.new(vel.X, 0, vel.Z)
 		local speed = flatVel.Magnitude
 
-		-- Only rotate when actually moving
 		if speed > 1 then
 			local desiredYaw = math.atan2(-flatVel.Unit.X, -flatVel.Unit.Z)
-
-			-- Smoothly rotate toward velocity direction
 			local yawDiff = math.atan2(math.sin(desiredYaw - lastYaw), math.cos(desiredYaw - lastYaw))
 			lastYaw = lastYaw + yawDiff * math.min(1, S.ROTATION_SPEED * dt)
 
-			-- VISUAL TILT: lean based on how much we're turning
 			local targetTilt = math.clamp(yawDiff * 30, -S.TILT_AMOUNT, S.TILT_AMOUNT)
 			currentTilt = currentTilt + (targetTilt - currentTilt) * math.min(1, S.TILT_SPEED * dt)
 
-			-- VISUAL PITCH: based on acceleration/deceleration
 			local accel = speed - lastSpeed
 			local targetPitch = math.clamp(-accel * 0.5, -S.PITCH_AMOUNT, S.PITCH_AMOUNT)
 			currentPitch = currentPitch + (targetPitch - currentPitch) * math.min(1, S.PITCH_SPEED * dt)
 		else
-			-- Stopped: ease tilt/pitch back to zero
 			currentTilt = currentTilt * (1 - math.min(1, 8 * dt))
 			currentPitch = currentPitch * (1 - math.min(1, 8 * dt))
 		end
 
 		lastSpeed = speed
 
-		-- Apply rotation to rootpart
-		local targetCF = CFrame.new(rootPart.Position) 
-			* CFrame.Angles(0, lastYaw, 0) 
+		local targetCF = CFrame.new(rootPart.Position)
+			* CFrame.Angles(0, lastYaw, 0)
 			* CFrame.Angles(math.rad(currentPitch), 0, math.rad(currentTilt))
 
 		rootPart.CFrame = rootPart.CFrame:Lerp(targetCF, math.min(1, S.ROTATION_SPEED * dt))
@@ -152,107 +144,181 @@ local function stopDriveController()
 end
 
 ------------------------------------------------------------
--- GAME ZONE DETECTION (ZonePlus)
--- Finds ALL Parts named "GameZone" in Workspace.
--- Each should have a string Attribute "Rarity" (Common, Uncommon, etc.)
--- Entering any zone → morph. Leaving all zones → unmorph.
+-- ZONE DETECTION
 ------------------------------------------------------------
-local activeZones = {} -- Track which zones we're currently inside: [zonePart] = rarity
-local trackedZones = {} -- [zonePart] = true, so we don't double-track
+local function titleCase(s: string): string
+	if #s == 0 then return s end
+	return string.upper(string.sub(s, 1, 1)) .. string.lower(string.sub(s, 2))
+end
 
--- Forward declaration (defined after UI creation)
-local updateZoneLabel
+local function getCurrentRarityFromActiveZones(): string
+	local priority = {"Legendary", "Epic", "Rare", "Uncommon", "Common"}
+	local found = {}
+	for _, rarity in pairs(activeGameRarityZones) do
+		found[rarity] = true
+	end
+	for _, rarity in ipairs(priority) do
+		if found[rarity] then
+			return rarity
+		end
+	end
+	for _, rarity in pairs(activeGameRarityZones) do
+		return rarity
+	end
+	return "Common"
+end
 
-local function trackZonePart(zonePart)
+local function getCurrentDynoMultiplier(): number
+	local best = 0
+	for _, mult in pairs(activeDynoZones) do
+		if mult > best then best = mult end
+	end
+	return best
+end
+
+local function isInAnyGameZone(): boolean
+	for _ in pairs(activeGameRarityZones) do
+		return true
+	end
+	return false
+end
+
+local function isInAnyDynoZone(): boolean
+	for _ in pairs(activeDynoZones) do
+		return true
+	end
+	return false
+end
+
+local function pushZoneStateToServer()
+	local inGameZone = isInAnyGameZone()
+	local inDynoZone = isInAnyDynoZone()
+	local rarity = getCurrentRarityFromActiveZones()
+	local dynoMult = getCurrentDynoMultiplier()
+
+	if inGameZone ~= lastSentInGameZone or inDynoZone ~= lastSentInDynoZone or rarity ~= lastSentRarity or dynoMult ~= lastSentDynoMult then
+		lastSentInGameZone = inGameZone
+		lastSentInDynoZone = inDynoZone
+		lastSentRarity = rarity
+		lastSentDynoMult = dynoMult
+		ZoneChanged:FireServer(inGameZone, rarity, dynoMult, inDynoZone)
+	end
+end
+
+local function hasAncestorNamed(inst: Instance, targetName: string): boolean
+	local p = inst.Parent
+	while p do
+		if p.Name == targetName then
+			return true
+		end
+		p = p.Parent
+	end
+	return false
+end
+
+local function inferRarityFromZonePart(part: BasePart): string?
+	local attr = part:GetAttribute("Rarity")
+	if type(attr) == "string" and attr ~= "DynoZone" then
+		return titleCase(attr)
+	end
+
+	local n = string.lower(part.Name)
+	if string.sub(n, -4) == "zone" then
+		local base = string.sub(part.Name, 1, #part.Name - 4)
+		if base ~= "" and string.lower(base) ~= "dyno" and not string.find(string.lower(base), "dyno") then
+			return titleCase(base)
+		end
+	end
+
+	return nil
+end
+
+local function inferDynoMultiplierFromPart(part: BasePart): number?
+	local m = part:GetAttribute("SpeedMultiplier")
+	if type(m) == "number" and m >= 1 then
+		return m
+	end
+
+	local n = string.lower(part.Name)
+	if string.find(n, "dynozone") then
+		local x = string.match(n, "(%d+)x")
+		if x then
+			return tonumber(x) or 1
+		end
+		return 1
+	end
+
+	return nil
+end
+
+local function trackZonePart(zonePart: BasePart)
 	if trackedZones[zonePart] then return end
 	trackedZones[zonePart] = true
 
-	local rarity = zonePart:GetAttribute("Rarity") or "Common"
+	local rarity = inferRarityFromZonePart(zonePart)
+	local dynoMult = inferDynoMultiplierFromPart(zonePart)
+
+	if not rarity and not dynoMult then
+		return
+	end
+
 	local zone = Zone.new(zonePart)
 
 	zone.playerEntered:Connect(function(enteringPlayer)
-		if enteringPlayer == Player then
-			activeZones[zonePart] = rarity
-			ZoneChanged:FireServer(true, rarity)
-			updateZoneLabel()
+		if enteringPlayer ~= Player then return end
+		if rarity then
+			activeGameRarityZones[zonePart] = rarity
 		end
+		if dynoMult then
+			activeDynoZones[zonePart] = dynoMult
+		end
+		pushZoneStateToServer()
+		if updateZoneLabel then updateZoneLabel() end
+		updateFuelVisibility()
 	end)
 
 	zone.playerExited:Connect(function(exitingPlayer)
-		if exitingPlayer == Player then
-			activeZones[zonePart] = nil
-
-			-- Check if still in any other zone
-			local stillInZone = false
-			local currentRarity = nil
-			for _, r in activeZones do
-				stillInZone = true
-				currentRarity = r
-				break
-			end
-
-			if stillInZone then
-				ZoneChanged:FireServer(true, currentRarity)
-			else
-				ZoneChanged:FireServer(false, nil)
-			end
-			updateZoneLabel()
-		end
+		if exitingPlayer ~= Player then return end
+		activeGameRarityZones[zonePart] = nil
+		activeDynoZones[zonePart] = nil
+		pushZoneStateToServer()
+		if updateZoneLabel then updateZoneLabel() end
+		updateFuelVisibility()
 	end)
 end
 
 local function setupZoneDetection()
-	-- Track any GameZone parts already in workspace
-	for _, obj in workspace:GetDescendants() do
-		if obj:IsA("BasePart") and obj.Name == "GameZone" then
-			trackZonePart(obj)
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			local isDyno = string.find(string.lower(obj.Name), "dynozone") ~= nil
+			local isGameSubZone = hasAncestorNamed(obj, "GameZone")
+			local isLegacyGameZonePart = obj.Name == "GameZone"
+			if isDyno or isGameSubZone or isLegacyGameZonePart then
+				trackZonePart(obj)
+			end
 		end
 	end
 
-	-- Also track GameZone parts that get added later (streaming / dynamic)
 	workspace.DescendantAdded:Connect(function(obj)
-		if obj:IsA("BasePart") and obj.Name == "GameZone" then
-			trackZonePart(obj)
+		if obj:IsA("BasePart") then
+			local isDyno = string.find(string.lower(obj.Name), "dynozone") ~= nil
+			local isGameSubZone = hasAncestorNamed(obj, "GameZone")
+			local isLegacyGameZonePart = obj.Name == "GameZone"
+			if isDyno or isGameSubZone or isLegacyGameZonePart then
+				trackZonePart(obj)
+			end
 		end
 	end)
 
-	local count = 0
-	for _ in trackedZones do count += 1 end
-
-	if count == 0 then
-		-- Nothing found yet — wait a bit and retry once
-		task.delay(5, function()
-			for _, obj in workspace:GetDescendants() do
-				if obj:IsA("BasePart") and obj.Name == "GameZone" then
-					trackZonePart(obj)
-				end
-			end
-
-			local retryCount = 0
-			for _ in trackedZones do retryCount += 1 end
-			if retryCount == 0 then
-				warn("[DriveClient] No GameZone parts found in Workspace after retry!")
-			else
-				print("[DriveClient] Found " .. retryCount .. " GameZone(s) on retry")
-			end
-		end)
-	else
-		print("[DriveClient] Tracking " .. count .. " GameZone(s)")
-	end
+	pushZoneStateToServer()
 end
 
 ------------------------------------------------------------
--- WHEEL SPIN ANIMATION
--- Your SmallTruck wheels: Wheels/Tire1/(Tire1, ATire1), etc.
--- Each tire meshpart has a "WheelWeld" connecting it to DriveSeat.
--- We spin the weld's C1 to rotate the wheel visually.
---
--- SPIN AXIS: Depending on how the mesh was modeled, the correct
--- rotation axis may be X, Y, or Z. We default to X (forward roll).
--- If wheels spin the wrong way, change WHEEL_SPIN_AXIS below.
+-- WHEEL SPIN ANIMATION (movement + dyno idle spin)
 ------------------------------------------------------------
-local WHEEL_SPIN_AXIS = "Z" -- Matches the tire orientation on the SmallTruck model
-local WHEEL_SPIN_SPEED = 4  -- Visual multiplier (higher = faster spinning)
+local WHEEL_SPIN_AXIS = "Z"
+local WHEEL_SPIN_SPEED = 4
+local DYNO_IDLE_SPIN_SPEED = 30  -- fast idle spin in dyno
 
 local function startWheelSpin()
 	if wheelSpinConnection then return end
@@ -272,10 +338,15 @@ local function startWheelSpin()
 
 		local speed = rootPart.AssemblyLinearVelocity.Magnitude
 
-		if speed > 0.5 then
-			local spinAmount = speed * dt * WHEEL_SPIN_SPEED
+		-- In dyno zone: spin wheels even when stationary
+		local inDyno = isInAnyDynoZone()
+		local effectiveSpinSpeed = speed
+		if inDyno and speed < 1 then
+			effectiveSpinSpeed = DYNO_IDLE_SPIN_SPEED
+		end
 
-			-- Build the rotation CFrame based on chosen axis
+		if effectiveSpinSpeed > 0.5 then
+			local spinAmount = effectiveSpinSpeed * dt * WHEEL_SPIN_SPEED
 			local spinCF
 			if WHEEL_SPIN_AXIS == "X" then
 				spinCF = CFrame.Angles(spinAmount, 0, 0)
@@ -289,9 +360,7 @@ local function startWheelSpin()
 				if tireModel:IsA("Model") then
 					for _, part in tireModel:GetChildren() do
 						if part:IsA("BasePart") then
-							-- Look for WheelWeld (from server) or TruckWeld (fallback)
-							local weld = part:FindFirstChild("WheelWeld") 
-								or part:FindFirstChild("TruckWeld")
+							local weld = part:FindFirstChild("WheelWeld") or part:FindFirstChild("TruckWeld")
 							if weld then
 								weld.C1 = weld.C1 * spinCF
 							end
@@ -322,7 +391,6 @@ local function createUI()
 	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	screenGui.Parent = Player.PlayerGui
 
-	-- Fuel bar container (top center)
 	fuelFrame = Instance.new("Frame")
 	fuelFrame.Name = "FuelFrame"
 	fuelFrame.Size = UDim2.new(0, 280, 0, 28)
@@ -341,7 +409,6 @@ local function createUI()
 	fuelStroke.Color = Color3.fromRGB(80, 80, 100)
 	fuelStroke.Parent = fuelFrame
 
-	-- Fuel fill bar
 	fuelBar = Instance.new("Frame")
 	fuelBar.Name = "FuelFill"
 	fuelBar.Size = UDim2.new(1, -6, 1, -6)
@@ -354,7 +421,6 @@ local function createUI()
 	fillCorner.CornerRadius = UDim.new(0, 6)
 	fillCorner.Parent = fuelBar
 
-	-- Fuel text
 	fuelLabel = Instance.new("TextLabel")
 	fuelLabel.Name = "FuelText"
 	fuelLabel.Size = UDim2.new(1, 0, 1, 0)
@@ -366,11 +432,10 @@ local function createUI()
 	fuelLabel.ZIndex = 5
 	fuelLabel.Parent = fuelFrame
 
-	-- Zone status indicator (below fuel bar)
 	zoneLabel = Instance.new("TextLabel")
 	zoneLabel.Name = "ZoneStatus"
-	zoneLabel.Size = UDim2.new(0, 220, 0, 22)
-	zoneLabel.Position = UDim2.new(0.5, -110, 0, 44)
+	zoneLabel.Size = UDim2.new(0, 280, 0, 22)
+	zoneLabel.Position = UDim2.new(0.5, -140, 0, 44)
 	zoneLabel.BackgroundTransparency = 1
 	zoneLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
 	zoneLabel.Text = ""
@@ -380,23 +445,29 @@ local function createUI()
 	zoneLabel.Parent = screenGui
 end
 
+-- NEW: Fuel UI visibility depends on whether in DynoZone
+function updateFuelVisibility()
+	if not fuelFrame then return end
+	local inDyno = isInAnyDynoZone()
+	-- Show fuel ONLY when morphed AND NOT in a DynoZone
+	fuelFrame.Visible = isMorphed and not inDyno
+end
+
 local function updateFuelUI(fuel, max)
 	if not fuelFrame then return end
 
 	currentFuel = fuel
 	maxFuel = max
 
-	fuelFrame.Visible = isMorphed
+	-- Respect dyno hiding
+	updateFuelVisibility()
 	fuelLabel.Text = string.format("FUEL: %d / %d", math.floor(fuel), max)
 
 	local pct = math.clamp(fuel / max, 0, 1)
-
-	-- Tween the fill bar width
 	TweenService:Create(fuelBar, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
 		Size = UDim2.new(pct, -6 + (6 * (1 - pct)), 1, -6)
 	}):Play()
 
-	-- Color based on fuel level
 	if pct > 0.5 then
 		fuelBar.BackgroundColor3 = Color3.fromRGB(80, 210, 80)
 	elseif pct > 0.2 then
@@ -410,22 +481,23 @@ updateZoneLabel = function()
 	if not zoneLabel then return end
 
 	zoneLabel.Visible = isMorphed
+	if not isMorphed then return end
 
-	if isMorphed then
-		-- Check if in any zone
-		local currentRarity = nil
-		for _, r in activeZones do
-			currentRarity = r
-			break
-		end
+	local inGame = isInAnyGameZone()
+	local inDyno = isInAnyDynoZone()
+	local rarity = getCurrentRarityFromActiveZones()
+	local dynoMult = getCurrentDynoMultiplier()
 
-		if currentRarity then
-			zoneLabel.Text = currentRarity:upper() .. " ZONE — Fuel draining"
-			zoneLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
-		else
-			zoneLabel.Text = "SAFE ZONE — Fuel paused"
-			zoneLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
-		end
+	if inDyno then
+		local label = dynoMult > 1 and (dynoMult .. "x") or "1x"
+		zoneLabel.Text = "DYNO " .. label .. " | SPEED BOOST ACTIVE"
+		zoneLabel.TextColor3 = Color3.fromRGB(255, 100, 255)
+	elseif inGame then
+		zoneLabel.Text = string.format("%s ZONE", string.upper(rarity))
+		zoneLabel.TextColor3 = Color3.fromRGB(255, 180, 120)
+	else
+		zoneLabel.Text = "OUT OF ZONE"
+		zoneLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
 	end
 end
 
@@ -436,55 +508,43 @@ MorphEvent.OnClientEvent:Connect(function()
 	isMorphed = true
 	startWheelSpin()
 	startDriveController()
+	updateFuelVisibility()
 	updateZoneLabel()
-
-	if fuelFrame then
-		fuelFrame.Visible = true
-	end
 end)
 
 UnmorphEvent.OnClientEvent:Connect(function()
 	isMorphed = false
 	stopWheelSpin()
 	stopDriveController()
+	if fuelFrame then fuelFrame.Visible = false end
+	if zoneLabel then zoneLabel.Visible = false end
 	updateZoneLabel()
-
-	if fuelFrame then
-		fuelFrame.Visible = false
-	end
-	if zoneLabel then
-		zoneLabel.Visible = false
-	end
 end)
 
 FuelUpdate.OnClientEvent:Connect(function(fuel, max)
 	updateFuelUI(fuel, max)
 end)
 
-------------------------------------------------------------
--- HANDLE RESPAWN
-------------------------------------------------------------
 Player.CharacterAdded:Connect(function()
 	isMorphed = false
-	activeZones = {}
+	activeGameRarityZones = {}
+	activeDynoZones = {}
+	lastSentInGameZone = false
+	lastSentInDynoZone = false
+	lastSentRarity = "Common"
+	lastSentDynoMult = 1
 	stopWheelSpin()
 	stopDriveController()
-
-	if fuelFrame then
-		fuelFrame.Visible = false
-	end
-	if zoneLabel then
-		zoneLabel.Visible = false
-	end
+	if fuelFrame then fuelFrame.Visible = false end
+	if zoneLabel then zoneLabel.Visible = false end
+	pushZoneStateToServer()
 end)
 
-------------------------------------------------------------
--- INIT
-------------------------------------------------------------
 createUI()
 setupZoneDetection()
 
 print("[DriveClient] Loaded!")
+
 ---
 
 --- StarterPlayer.StarterPlayerScripts.PickupClient (LocalScript) ---
@@ -574,15 +634,17 @@ end)
 	click Buy button to upgrade. Auto-selects brainrot from equipped Tool.
 	
 	FIXES:
-	1. Upgrade button: Added ClickDetector fallback on ControlCenter part
-	   so clicking the stand's upgrade panel works reliably on all platforms.
-	2. SurfaceGui: Ensured AlwaysOnTop = false, proper Face, and
-	   MaxDistance set so raycasting works.
-	3. Buy button & parent frames: Ensured Active = true propagates
-	   correctly so mouse events fire through the SurfaceGui hierarchy.
+	1. Upgrade button: Added ClickDetector fallback on ControlCenter part.
+	2. SurfaceGui: Ensured proper MaxDistance and Active propagation.
+	3. NEW: ALL upgrade effects now handled client-side via UpgradeVfxEvent:
+	   - $$$ money VFX → on the brainrot
+	   - B - Hit 02 VFX → on the ControlCenter (upgrade GUI area)
+	   - Jump animation → on the brainrot
+	   Both VFX templates must be in ReplicatedStorage.Vfx
 --]]
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 
@@ -590,9 +652,16 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 local PlaceRemote = Remotes:WaitForChild("PlaceBrainrot")
 local RemoveRemote = Remotes:WaitForChild("RemoveFromStand")
 local UpgradeRemote = Remotes:WaitForChild("UpgradeBrainrot")
+local UpgradeVfxRemote = Remotes:WaitForChild("UpgradeVfxEvent")
 
 local selectedBrainrotUUID: string? = nil
 local selectedBrainrotName: string? = nil
+
+------------------------------------------------------------
+-- VFX TEMPLATES (from ReplicatedStorage)
+------------------------------------------------------------
+local VfxFolder = ReplicatedStorage:WaitForChild("Vfx")
+local MoneyVfxTemplate = VfxFolder:WaitForChild("$$$")
 
 ------------------------------------------------------------
 -- AUTO-SELECT FROM EQUIPPED TOOL
@@ -655,6 +724,231 @@ local function updateControlCenter(standModel: Model, hasBrainrot: boolean)
 		gui.Enabled = hasBrainrot
 	end
 end
+
+------------------------------------------------------------
+-- PLOT LOOKUP HELPER (shared by VFX and wiring)
+------------------------------------------------------------
+local function getStandModelFromKey(standKey: string): Model?
+	local plotName = player:GetAttribute("AssignedPlot")
+	if not plotName then return nil end
+
+	local plots = workspace:FindFirstChild("World")
+	if not plots then return nil end
+	plots = plots:FindFirstChild("Plots")
+	if not plots then return nil end
+
+	local plot = plots:FindFirstChild(plotName)
+	if not plot then return nil end
+
+	local floorNum, standNum = standKey:match("^(%d+)_(%d+)$")
+	if not floorNum then return nil end
+
+	local floors = plot:FindFirstChild("Floors")
+	if not floors then return nil end
+
+	local floor = floors:FindFirstChild(tostring(floorNum))
+	if not floor then return nil end
+
+	local stands = floor:FindFirstChild("Stands")
+	if not stands then return nil end
+
+	return stands:FindFirstChild(tostring(standNum))
+end
+
+------------------------------------------------------------
+-- VFX HELPER
+-- Clones a VFX template, parents its attachment to a target
+-- part, reads emitter attributes, emits, then cleans up.
+------------------------------------------------------------
+local function playVfx(vfxTemplate: BasePart, targetPart: BasePart)
+	local templateAttachment = vfxTemplate:FindFirstChildWhichIsA("Attachment", true)
+	if not templateAttachment then
+		return
+	end
+
+	local attachment = templateAttachment:Clone()
+	attachment.Parent = targetPart
+
+	local emitters = {}
+	for _, child in attachment:GetDescendants() do
+		if child:IsA("ParticleEmitter") then
+			child.Enabled = false
+			table.insert(emitters, child)
+		end
+	end
+
+	local maxLifetime = 0
+
+	for _, emitter in emitters do
+		local emitDelay = emitter:GetAttribute("EmitDelay") or 0
+		local emitDuration = emitter:GetAttribute("EmitDuration")
+		if emitDuration == nil then
+			emitDuration = 0.35
+		end
+
+		local emitCount = emitter:GetAttribute("EmitCount")
+		if emitCount == nil then
+			-- Fallback for templates that rely on low Rate without burst attrs.
+			emitCount = math.max(8, math.floor(emitter.Rate * 8))
+		end
+
+		local emitterLifetime = emitDelay + emitDuration + 2
+		if emitterLifetime > maxLifetime then
+			maxLifetime = emitterLifetime
+		end
+
+		task.spawn(function()
+			if emitDelay > 0 then
+				task.wait(emitDelay)
+			end
+
+			if emitCount > 0 then
+				emitter:Emit(emitCount)
+			end
+
+			emitter.Enabled = true
+			task.wait(emitDuration)
+			emitter.Enabled = false
+		end)
+	end
+
+	task.delay(maxLifetime, function()
+		if attachment and attachment.Parent then
+			attachment:Destroy()
+		end
+	end)
+end
+
+------------------------------------------------------------
+-- JUMP ANIMATION FOR BRAINROT VISUAL
+------------------------------------------------------------
+local JUMP_HEIGHT = 3
+local JUMP_UP_TIME = 0.2
+local JUMP_DOWN_TIME = 0.25
+
+local function tweenModelPivot(model: Model, fromCF: CFrame, toCF: CFrame, info: TweenInfo)
+	local value = Instance.new("CFrameValue")
+	value.Value = fromCF
+
+	local conn
+	conn = value:GetPropertyChangedSignal("Value"):Connect(function()
+		if model.Parent then
+			model:PivotTo(value.Value)
+		end
+	end)
+
+	local t = TweenService:Create(value, info, { Value = toCF })
+	t.Completed:Once(function()
+		if conn then conn:Disconnect() end
+		value:Destroy()
+	end)
+	t:Play()
+	return t
+end
+
+local function playJumpAnimation(visual: Instance)
+	if visual:IsA("Model") then
+		local restCF = visual:GetPivot()
+		local jumpUpCF = restCF * CFrame.new(0, JUMP_HEIGHT, 0)
+
+		local upTween = tweenModelPivot(
+			visual,
+			restCF,
+			jumpUpCF,
+			TweenInfo.new(JUMP_UP_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		)
+
+		upTween.Completed:Once(function()
+			tweenModelPivot(
+				visual,
+				jumpUpCF,
+				restCF,
+				TweenInfo.new(JUMP_DOWN_TIME, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out)
+			)
+		end)
+
+	elseif visual:IsA("BasePart") then
+		local restCF = visual.CFrame
+		local jumpUpCF = restCF * CFrame.new(0, JUMP_HEIGHT, 0)
+
+		local upTween = TweenService:Create(visual, TweenInfo.new(
+			JUMP_UP_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
+		), { CFrame = jumpUpCF })
+
+		local downTween = TweenService:Create(visual, TweenInfo.new(
+			JUMP_DOWN_TIME, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out
+		), { CFrame = restCF })
+
+		upTween:Play()
+		upTween.Completed:Once(function()
+			downTween:Play()
+		end)
+	end
+end
+
+local function getVisualCenterPosition(visual: Instance): Vector3?
+	if visual:IsA("Model") then
+		local boundsCF = visual:GetBoundingBox()
+		return boundsCF.Position
+	elseif visual:IsA("BasePart") then
+		return visual.Position
+	end
+	return nil
+end
+
+local function makeTempAnchorAt(position: Vector3, parent: Instance): BasePart
+	local p = Instance.new("Part")
+	p.Name = "__UpgradeFxAnchor"
+	p.Size = Vector3.new(0.2, 0.2, 0.2)
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.Transparency = 1
+	p.CFrame = CFrame.new(position)
+	p.Parent = parent
+	task.delay(3, function()
+		if p.Parent then p:Destroy() end
+	end)
+	return p
+end
+
+------------------------------------------------------------
+-- UPGRADE EFFECTS (ALL CLIENT-SIDE)
+-- Fired by server via UpgradeVfxEvent with standKey.
+-- $$$ money VFX  → on the brainrot
+-- B - Hit 02     → on the ControlCenter (upgrade GUI area)
+-- Brainrot jumps
+------------------------------------------------------------
+local function playUpgradeEffects(standKey: string)
+	local standModel = getStandModelFromKey(standKey)
+	if not standModel then return end
+
+	local stand = standModel:FindFirstChild("Stand")
+	if not stand then return end
+
+	local platform = stand:FindFirstChild("Platform")
+	if not platform then return end
+
+	local cc = stand:FindFirstChild("ControlCenter")
+	local visual = platform:FindFirstChild("BrainrotVisual")
+	if not visual then return end
+
+	local centerPos = getVisualCenterPosition(visual)
+	if centerPos then
+		local anchor = makeTempAnchorAt(centerPos, platform)
+		playVfx(MoneyVfxTemplate, anchor)
+	end
+
+	playJumpAnimation(visual)
+end
+
+------------------------------------------------------------
+-- LISTEN FOR UPGRADE VFX EVENT FROM SERVER
+------------------------------------------------------------
+UpgradeVfxRemote.OnClientEvent:Connect(function(standKey: string)
+	playUpgradeEffects(standKey)
+end)
 
 ------------------------------------------------------------
 -- STAND WIRING
@@ -729,11 +1023,6 @@ end
 
 ------------------------------------------------------------
 -- WIRE UPGRADE BUTTONS
--- FIX: Multiple methods to ensure the upgrade click registers:
---   1. SurfaceGui button MouseButton1Click (original)
---   2. SurfaceGui button Activated (more reliable cross-platform)
---   3. ClickDetector on the ControlCenter part (fallback for
---      cases where SurfaceGui input doesn't propagate)
 ------------------------------------------------------------
 local upgradeCooldowns = {} -- [standKey] = tick
 
@@ -749,15 +1038,13 @@ local function wireUpgradeButton(buyButton: ImageButton, standKey: string, contr
 		UpgradeRemote:FireServer(standKey)
 	end
 
-	-- Method 1: MouseButton1Click (original — works on desktop with SurfaceGui)
+	-- Method 1: MouseButton1Click (desktop with SurfaceGui)
 	buyButton.MouseButton1Click:Connect(doUpgrade)
 
 	-- Method 2: Activated (more reliable, fires on click/tap/gamepad)
 	buyButton.Activated:Connect(doUpgrade)
 
-	-- Method 3: ClickDetector on the ControlCenter part itself
-	-- This is a reliable fallback — if the SurfaceGui isn't intercepting
-	-- mouse input, the ClickDetector on the underlying part will catch it.
+	-- Method 3: ClickDetector on the ControlCenter part (fallback)
 	if controlCenterPart then
 		local existingClick = controlCenterPart:FindFirstChild("UpgradeClick")
 		if not existingClick then
@@ -768,8 +1055,6 @@ local function wireUpgradeButton(buyButton: ImageButton, standKey: string, contr
 
 			click.MouseClick:Connect(function(clickPlayer: Player)
 				if clickPlayer ~= player then return end
-				-- Only upgrade if there's a brainrot on the stand
-				-- (the GUI being enabled implies a brainrot is placed)
 				local stand = controlCenterPart.Parent
 				if not stand then return end
 				local platform = stand:FindFirstChild("Platform")
@@ -834,8 +1119,8 @@ local function wirePlotStands()
 			local cc = stand:FindFirstChild("ControlCenter")
 			if cc and cc:IsA("BasePart") then
 				cc.Transparency = 1
-				cc.CanQuery = true -- Needed for raycasting / SurfaceGui clicks
-				cc.CanCollide = false -- Don't block player movement
+				cc.CanQuery = true
+				cc.CanCollide = false
 			end
 
 			-- Setup SurfaceGui
@@ -843,16 +1128,12 @@ local function wirePlotStands()
 				local gui = cc:FindFirstChild("SurfaceGui")
 				if gui then
 					gui.Active = true
-					gui.Enabled = false -- hidden until brainrot placed
+					gui.Enabled = false
 
-					-- FIX: Ensure the SurfaceGui has a reasonable interaction distance
-					-- Default is inf which is fine, but set it explicitly just in case
 					if gui:IsA("SurfaceGui") then
-						gui.MaxDistance = 32 -- can interact from up to 32 studs away
+						gui.MaxDistance = 32
 					end
 
-					-- FIX: Make sure the Upgrade frame and Buy button have Active = true
-					-- so mouse events propagate through the SurfaceGui hierarchy
 					local upgrade = gui:FindFirstChild("Upgrade")
 					if upgrade then
 						if upgrade:IsA("GuiObject") then
@@ -864,7 +1145,6 @@ local function wirePlotStands()
 							if buy:IsA("GuiObject") then
 								buy.Active = true
 							end
-							-- Pass the ControlCenter part for ClickDetector fallback
 							wireUpgradeButton(buy, key, cc)
 						end
 					end
@@ -926,4 +1206,1425 @@ updateMoneyLabel()
 
 -- Update whenever money changes
 moneyValue.Changed:Connect(updateMoneyLabel)
+---
+
+--- StarterPlayer.StarterPlayerScripts.HUD.SpinHud (LocalScript) ---
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local getSpinCount = remotes:WaitForChild("GetSpinCount")
+local requestSpin = remotes:WaitForChild("RequestSpin")
+local spinCountUpdated = remotes:WaitForChild("SpinCountUpdated")
+local getSpinStatus = remotes:WaitForChild("GetSpinStatus")
+local spinTimerUpdated = remotes:WaitForChild("SpinTimerUpdated")
+local requestSpinPurchase = remotes:WaitForChild("RequestSpinPurchase")
+
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local spinFrame = fullGui:WaitForChild("SpinFrame")
+local spinButtons = spinFrame:WaitForChild("SpinButtons")
+local spinButton = spinButtons:WaitForChild("SpinButton")
+local spinText = spinButton:WaitForChild("SpinText")
+local wheelFrame = spinFrame:WaitForChild("WheelFrame")
+
+local timeRoot = spinFrame:FindFirstChild("Time")
+local timeInner = timeRoot and timeRoot:FindFirstChild("Time")
+local timeA = timeInner and timeInner:FindFirstChild("TimeA")
+local timeB = timeInner and timeInner:FindFirstChild("TimeB")
+
+local HOVER_INFO = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local PRESS_INFO = TweenInfo.new(0.09, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local RELEASE_INFO = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local DEFAULT_ROT = 0
+local HOVER_ROT = -8
+local PRESS_ROT = 12
+local HOVER_SCALE = 1.12
+local PRESS_SCALE = 0.92
+local NORMAL_SCALE = 1
+
+local function tween(instance, info, goals)
+    local t = TweenService:Create(instance, info, goals)
+    t:Play()
+    return t
+end
+
+local function getWheelContainer()
+    for _, child in ipairs(wheelFrame:GetChildren()) do
+        if child.Name == "Background" and child:IsA("Frame") then
+            return child
+        end
+    end
+
+    local fallback = wheelFrame:FindFirstChild("Background")
+    if fallback and fallback:IsA("GuiObject") then
+        return fallback
+    end
+
+    return nil
+end
+
+local wheelContainer = getWheelContainer()
+if not wheelContainer then
+    warn("[SpinHud] Wheel container not found")
+    return
+end
+
+local function getSectors()
+    local sectors = {}
+    for _, child in ipairs(wheelContainer:GetChildren()) do
+        if child:IsA("GuiObject") and string.sub(child.Name, 1, 6) == "Sector" then
+            table.insert(sectors, child)
+        end
+    end
+
+    table.sort(sectors, function(a, b)
+        return a.Name < b.Name
+    end)
+
+    return sectors
+end
+
+local sectors = getSectors()
+local sectorCount = #sectors
+
+local currentSpins = 0
+local secondsToNextSpin = 30 * 60
+local spinning = false
+local timerAccumulator = 0
+
+local function setSpinText(value)
+    spinText.Text = string.format("SPIN! [%dx]", math.max(0, math.floor(value)))
+end
+
+
+local function setTimeText(seconds)
+    local s = math.max(0, math.floor(seconds))
+    local minutes = math.floor(s / 60)
+    local secs = s % 60
+    local formatted = string.format("%02d:%02d", minutes, secs)
+
+    if timeA and timeA:IsA("TextLabel") then
+        timeA.Text = formatted
+    end
+    if timeB and timeB:IsA("TextLabel") then
+        timeB.Text = formatted
+    end
+end
+
+local function applyStatus(spins, seconds)
+    if type(spins) == "number" then
+        currentSpins = spins
+        setSpinText(currentSpins)
+    end
+    if type(seconds) == "number" then
+        secondsToNextSpin = math.max(0, math.floor(seconds))
+        setTimeText(secondsToNextSpin)
+    end
+end
+
+local function refreshStatusFromServer()
+    local ok, result = pcall(function()
+        return getSpinStatus:InvokeServer()
+    end)
+
+    if ok and type(result) == "table" then
+        applyStatus(result.Spins, result.SecondsToNext)
+        return
+    end
+
+    local countOk, count = pcall(function()
+        return getSpinCount:InvokeServer()
+    end)
+    if countOk and type(count) == "number" then
+        applyStatus(count, secondsToNextSpin)
+    else
+        warn("[SpinHud] Failed to fetch spin status", result)
+    end
+end
+
+spinCountUpdated.OnClientEvent:Connect(function(spins, seconds)
+    applyStatus(spins, seconds)
+end)
+
+spinTimerUpdated.OnClientEvent:Connect(function(seconds)
+    if type(seconds) == "number" then
+        secondsToNextSpin = math.max(0, math.floor(seconds))
+        setTimeText(secondsToNextSpin)
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    timerAccumulator += dt
+    while timerAccumulator >= 1 do
+        timerAccumulator -= 1
+        if secondsToNextSpin > 0 then
+            secondsToNextSpin -= 1
+            setTimeText(secondsToNextSpin)
+        end
+    end
+end)
+
+local function spinWheelToIndex(landedIndex)
+    if sectorCount <= 0 then
+        warn("[SpinHud] No sectors found in wheel")
+        return nil
+    end
+
+    local index = math.clamp(math.floor(landedIndex), 1, sectorCount)
+    local segmentAngle = 360 / sectorCount
+    local fullTurns = math.random(5, 8)
+
+    local targetCenter = (index - 1) * segmentAngle + (segmentAngle / 2)
+    local targetNormalized = -targetCenter
+
+    local currentRotation = wheelContainer.Rotation
+    local currentNormalized = currentRotation % 360
+    local delta = targetNormalized - currentNormalized
+    while delta <= 0 do
+        delta += 360
+    end
+
+    local totalDelta = (fullTurns * 360) + delta
+    local rotateTween = TweenService:Create(
+        wheelContainer,
+        TweenInfo.new(4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        { Rotation = currentRotation + totalDelta }
+    )
+
+    rotateTween:Play()
+    rotateTween.Completed:Wait()
+
+    return sectors[index], index
+end
+
+local function getOrMakeScale(guiObject)
+    local scale = guiObject:FindFirstChildOfClass("UIScale")
+    if not scale then
+        scale = Instance.new("UIScale")
+        scale.Scale = NORMAL_SCALE
+        scale.Parent = guiObject
+    end
+    return scale
+end
+
+local function getIcon(guiObject)
+    local byName = guiObject:FindFirstChild("icon67") or guiObject:FindFirstChild("Settings")
+    if byName and byName:IsA("GuiObject") then
+        return byName
+    end
+
+    for _, child in ipairs(guiObject:GetChildren()) do
+        if child:IsA("ImageLabel") then
+            local n = string.lower(child.Name)
+            if not string.match(n, "^bg") and n ~= "background" and n ~= "gradient" and not string.find(n, "stroke") then
+                return child
+            end
+        end
+    end
+
+    return nil
+end
+
+local function ensureHitbox(target)
+    local hitbox = target:FindFirstChild("_SpinHitbox")
+    if hitbox and hitbox:IsA("TextButton") then
+        return hitbox
+    end
+
+    if hitbox then
+        hitbox:Destroy()
+    end
+
+    hitbox = Instance.new("TextButton")
+    hitbox.Name = "_SpinHitbox"
+    hitbox.BackgroundTransparency = 1
+    hitbox.Text = ""
+    hitbox.AutoButtonColor = false
+    hitbox.Size = UDim2.fromScale(1, 1)
+    hitbox.Position = UDim2.fromScale(0, 0)
+    hitbox.ZIndex = target.ZIndex + 10
+    hitbox.Parent = target
+
+    return hitbox
+end
+
+local function setupInteractiveButton(target, onActivated)
+    if not target:IsA("GuiObject") then
+        return
+    end
+
+    local hitbox = ensureHitbox(target)
+    local scale = getOrMakeScale(target)
+    local icon = getIcon(target)
+
+    local hovering = false
+    local pressing = false
+
+    local function applyState()
+        if pressing then
+            if icon then
+                tween(icon, PRESS_INFO, { Rotation = PRESS_ROT })
+            end
+            tween(scale, PRESS_INFO, { Scale = PRESS_SCALE })
+        elseif hovering then
+            if icon then
+                tween(icon, HOVER_INFO, { Rotation = HOVER_ROT })
+            end
+            tween(scale, HOVER_INFO, { Scale = HOVER_SCALE })
+        else
+            if icon then
+                tween(icon, RELEASE_INFO, { Rotation = DEFAULT_ROT })
+            end
+            tween(scale, RELEASE_INFO, { Scale = NORMAL_SCALE })
+        end
+    end
+
+    hitbox.MouseEnter:Connect(function()
+        hovering = true
+        applyState()
+    end)
+
+    hitbox.MouseLeave:Connect(function()
+        hovering = false
+        pressing = false
+        applyState()
+    end)
+
+    hitbox.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            pressing = true
+            applyState()
+        end
+    end)
+
+    hitbox.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            pressing = false
+            applyState()
+        end
+    end)
+
+    hitbox.Activated:Connect(function()
+        tween(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 0.88 })
+        task.delay(0.07, applyState)
+        if onActivated then
+            onActivated()
+        end
+    end)
+end
+
+local function closeSpinFrame()
+    spinFrame.Visible = false
+end
+
+local function promptSpinPack(amount)
+    local ok, success, err = pcall(function()
+        return requestSpinPurchase:InvokeServer(amount)
+    end)
+
+    if not ok then
+        warn("[SpinHud] Failed to request spin purchase", success)
+        return
+    end
+
+    if not success then
+        warn("[SpinHud] Spin purchase rejected: " .. tostring(err))
+    end
+end
+
+local function onSpinActivated()
+    if spinning then
+        return
+    end
+
+    if currentSpins <= 0 then
+        print("[SpinHud] No spins available.")
+        return
+    end
+
+    if sectorCount <= 0 then
+        print("[SpinHud] Wheel has no sectors.")
+        return
+    end
+
+    spinning = true
+
+    local ok, success, landedIndex, spinsLeft, secondsLeft = pcall(function()
+        return requestSpin:InvokeServer(sectorCount)
+    end)
+
+    if not ok then
+        warn("[SpinHud] Spin request failed", success)
+        spinning = false
+        return
+    end
+
+    if not success then
+        print("[SpinHud] Server denied spin request.")
+        applyStatus(spinsLeft, secondsLeft)
+        spinning = false
+        return
+    end
+
+    applyStatus(spinsLeft, secondsLeft)
+
+    local sector, index = spinWheelToIndex(tonumber(landedIndex) or 1)
+    local landedName = sector and sector.Name or ("Sector" .. tostring(index or landedIndex or "?"))
+    print(string.format("[SpinHud] Landed on %s", landedName))
+
+    spinning = false
+end
+
+setSpinText(0)
+setTimeText(secondsToNextSpin)
+refreshStatusFromServer()
+
+setupInteractiveButton(spinButton, onSpinActivated)
+
+for _, child in ipairs(spinButtons:GetChildren()) do
+    if child ~= spinButton and child:IsA("GuiObject") and string.find(string.lower(child.Name), "button") then
+        setupInteractiveButton(child, nil)
+    end
+end
+
+local plusOne = spinButtons:FindFirstChild("Spin+1Button")
+if plusOne and plusOne:IsA("GuiObject") then
+    setupInteractiveButton(plusOne, function()
+        promptSpinPack(1)
+    end)
+end
+
+local plusFive = spinButtons:FindFirstChild("Spin+5Button")
+if plusFive and plusFive:IsA("GuiObject") then
+    setupInteractiveButton(plusFive, function()
+        promptSpinPack(5)
+    end)
+end
+
+local exitButton = spinFrame:FindFirstChild("Exitbutton")
+if exitButton and exitButton:IsA("GuiObject") then
+    setupInteractiveButton(exitButton, closeSpinFrame)
+end
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.HUD.SpinHudCountSync (LocalScript) ---
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local spinCountUpdated = remotes:WaitForChild("SpinCountUpdated")
+local getSpinStatus = remotes:FindFirstChild("GetSpinStatus")
+local getSpinCount = remotes:WaitForChild("GetSpinCount")
+
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local hudFrame = fullGui:WaitForChild("HUDFrame")
+local spinButton = hudFrame:WaitForChild("SpinButton")
+local spinText = spinButton:WaitForChild("SpinText")
+local numberLabel = spinText:WaitForChild("Number")
+
+local function setCount(count)
+    numberLabel.Text = string.format("%dx", math.max(0, math.floor(tonumber(count) or 0)))
+end
+
+local function refreshFromServer()
+    if getSpinStatus and getSpinStatus:IsA("RemoteFunction") then
+        local ok, status = pcall(function()
+            return getSpinStatus:InvokeServer()
+        end)
+        if ok and type(status) == "table" and type(status.Spins) == "number" then
+            setCount(status.Spins)
+            return
+        end
+    end
+
+    local ok, count = pcall(function()
+        return getSpinCount:InvokeServer()
+    end)
+    if ok and type(count) == "number" then
+        setCount(count)
+    end
+end
+
+spinCountUpdated.OnClientEvent:Connect(function(spins)
+    if type(spins) == "number" then
+        setCount(spins)
+    end
+end)
+
+setCount(0)
+refreshFromServer()
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.HUD.IndexClient (LocalScript) ---
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local FALLBACK_ICON = "rbxassetid://113016590802205"
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local BrainrotConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotConfig"))
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local getIndexData = remotes:WaitForChild("GetIndexData")
+local indexUpdated = remotes:WaitForChild("IndexUpdated")
+
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local indexFrame = fullGui:WaitForChild("IndexFrame")
+local content = indexFrame:WaitForChild("Content")
+local contentScroll = content:WaitForChild("ContentScrl"):WaitForChild("Content")
+local template = contentScroll:WaitForChild("Common")
+local listLayout = contentScroll:FindFirstChildOfClass("UIListLayout")
+
+local progressRoot = content:WaitForChild("Progress")
+local progressBar = progressRoot:WaitForChild("ProgressBar")
+local valueLabel = progressRoot:WaitForChild("Uilistlayout"):WaitForChild("Value"):FindFirstChildOfClass("TextLabel")
+local collectLabel = progressRoot:WaitForChild("Details"):WaitForChild("CollectNumber"):FindFirstChildOfClass("TextLabel")
+
+local header = indexFrame:WaitForChild("Header")
+local numbersA = header:WaitForChild("IndexOutof"):FindFirstChild("Numbersmth")
+local numbersB = header:WaitForChild("IndexOutof"):FindFirstChild("Numbersmthb")
+
+local baseProgressSize = progressBar.Size
+local cardsById = {}
+local seenMap = {}
+
+local function sortedCatalogIds()
+    local ids = {}
+    for id, _ in pairs(BrainrotConfig.Catalog) do
+        table.insert(ids, id)
+    end
+
+    table.sort(ids, function(a, b)
+        local na = tonumber(a)
+        local nb = tonumber(b)
+        if na and nb then
+            return na < nb
+        end
+        return a < b
+    end)
+
+    return ids
+end
+
+local function getImageForBrainrot(id, entry)
+    local image = entry and (entry.Image or entry.Icon or entry.ImageId)
+    if type(image) == "string" and image ~= "" then
+        return image
+    end
+    return FALLBACK_ICON
+end
+
+local function setCardSeenState(card, isSeen)
+    local icon = card:FindFirstChild("IconPlaceholder")
+    if icon and icon:IsA("ImageLabel") then
+        icon.ImageColor3 = isSeen and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(0, 0, 0)
+    end
+end
+
+local function setCardData(card, id, entry)
+    local rarity = entry.Rarity or "Common"
+    local displayName = entry.DisplayName or id
+
+    card.Name = "Card_" .. id
+
+    local icon = card:FindFirstChild("IconPlaceholder")
+    if icon and icon:IsA("ImageLabel") then
+        icon.Image = getImageForBrainrot(id, entry)
+    end
+
+    local moneyLabel = card:FindFirstChild("MoneyMaking")
+    if moneyLabel and moneyLabel:IsA("TextLabel") then
+        moneyLabel.Text = BrainrotConfig.FormatMoney(entry.BaseIncome or 0) .. "/s"
+    end
+
+    local variants = card:FindFirstChild("ColourVarients")
+    if variants and variants:IsA("Frame") then
+        for _, variantFrame in ipairs(variants:GetChildren()) do
+            if variantFrame:IsA("Frame") then
+                local isTarget = string.lower(variantFrame.Name) == string.lower(rarity)
+                variantFrame.Visible = isTarget
+
+                if isTarget then
+                    for _, desc in ipairs(variantFrame:GetDescendants()) do
+                        if desc:IsA("TextLabel") and string.find(string.upper(desc.Name), "NAME") then
+                            desc.Text = displayName
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function updateHeaderProgress()
+    local total = 0
+    local seen = 0
+
+    for id, _ in pairs(BrainrotConfig.Catalog) do
+        total += 1
+        if seenMap[id] then
+            seen += 1
+        end
+    end
+
+    local text = string.format("%d/%d", seen, total)
+
+    if valueLabel then
+        valueLabel.Text = text
+    end
+    if collectLabel then
+        collectLabel.Text = "Collect " .. tostring(seen)
+    end
+    if numbersA and numbersA:IsA("TextLabel") then
+        numbersA.Text = text
+    end
+    if numbersB and numbersB:IsA("TextLabel") then
+        numbersB.Text = text
+    end
+
+    local ratio = (total > 0) and (seen / total) or 0
+    progressBar.Size = UDim2.new(baseProgressSize.X.Scale * ratio, baseProgressSize.X.Offset * ratio, baseProgressSize.Y.Scale, baseProgressSize.Y.Offset)
+end
+
+local function rebuildCards()
+    cardsById = {}
+
+    for _, child in ipairs(contentScroll:GetChildren()) do
+        if child:IsA("Frame") and child ~= template then
+            child:Destroy()
+        end
+    end
+
+    local ids = sortedCatalogIds()
+    for _, id in ipairs(ids) do
+        local entry = BrainrotConfig.Catalog[id]
+        local card = template:Clone()
+        card.Visible = true
+        card.Parent = contentScroll
+        setCardData(card, id, entry)
+        setCardSeenState(card, seenMap[id] == true)
+        cardsById[id] = card
+    end
+
+    template.Visible = false
+
+    if listLayout then
+        task.defer(function()
+            contentScroll.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
+        end)
+    end
+
+    updateHeaderProgress()
+end
+
+local function applySeenUpdate(newSeen)
+    if type(newSeen) ~= "table" then
+        return
+    end
+
+    seenMap = {}
+    for id, value in pairs(newSeen) do
+        if value then
+            seenMap[id] = true
+        end
+    end
+
+    for id, card in pairs(cardsById) do
+        if card and card.Parent then
+            setCardSeenState(card, seenMap[id] == true)
+        end
+    end
+
+    updateHeaderProgress()
+end
+
+local function initialLoad()
+    local ok, payload = pcall(function()
+        return getIndexData:InvokeServer()
+    end)
+
+    if not ok or type(payload) ~= "table" then
+        warn("[IndexClient] Failed to get index data")
+        rebuildCards()
+        return
+    end
+
+    if type(payload.SeenBrainrots) == "table" then
+        for id, value in pairs(payload.SeenBrainrots) do
+            if value then
+                seenMap[id] = true
+            end
+        end
+    end
+
+    rebuildCards()
+end
+
+indexUpdated.OnClientEvent:Connect(function(payload)
+    if type(payload) == "table" and type(payload.SeenBrainrots) == "table" then
+        applySeenUpdate(payload.SeenBrainrots)
+    end
+end)
+
+if listLayout then
+    listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        contentScroll.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
+    end)
+end
+
+initialLoad()
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.UIAnim.UiController (LocalScript) ---
+--!strict
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local hudFrame = fullGui:WaitForChild("HUDFrame")
+local leftHUD = hudFrame:WaitForChild("LeftHUD")
+local topHUD = hudFrame:WaitForChild("TopHUD")
+local spinButton = hudFrame:WaitForChild("SpinButton")
+
+local SLIDE_DISTANCE = 90
+local STAGGER = 0.04
+
+local SLIDE_INFO   = TweenInfo.new(0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local HOVER_INFO   = TweenInfo.new(0.16, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
+local PRESS_INFO   = TweenInfo.new(0.09, Enum.EasingStyle.Back,  Enum.EasingDirection.Out)
+local RELEASE_INFO = TweenInfo.new(0.14, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
+
+local DEFAULT_ROT  = 0
+local HOVER_ROT    = -8
+local PRESS_ROT    = 12
+local HOVER_SCALE  = 1.12
+local PRESS_SCALE  = 0.92
+local NORMAL_SCALE = 1
+
+local function tween(instance: Instance, info: TweenInfo, goals: {[string]: any})
+	local t = TweenService:Create(instance, info, goals)
+	t:Play()
+	return t
+end
+
+local function getOrMakeScale(target: GuiObject): UIScale
+	local scale = target:FindFirstChildOfClass("UIScale")
+	if not scale then
+		scale = Instance.new("UIScale")
+		scale.Scale = NORMAL_SCALE
+		scale.Parent = target
+	end
+	return scale
+end
+
+local function getIcon(button: GuiObject): GuiObject?
+	local byName = button:FindFirstChild("icon67") or button:FindFirstChild("Settings")
+	if byName and byName:IsA("GuiObject") then return byName end
+	for _, child in ipairs(button:GetChildren()) do
+		if child:IsA("ImageLabel") then
+			local n = child.Name:lower()
+			if not n:match("^bg") and n ~= "background" then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+local function ensureHitbox(target: GuiObject): TextButton
+	local existing = target:FindFirstChild("_UiFxHitbox")
+	if existing and existing:IsA("TextButton") then
+		return existing
+	end
+
+	if existing then
+		existing:Destroy()
+	end
+
+	local hitbox = Instance.new("TextButton")
+	hitbox.Name = "_UiFxHitbox"
+	hitbox.BackgroundTransparency = 1
+	hitbox.Text = ""
+	hitbox.AutoButtonColor = false
+	hitbox.Size = UDim2.fromScale(1, 1)
+	hitbox.Position = UDim2.fromScale(0, 0)
+	hitbox.ZIndex = target.ZIndex + 10
+	hitbox.Parent = target
+	return hitbox
+end
+
+-- Standard effect: scale + icon tilt
+local function setupButton(button: ImageButton)
+	if button:GetAttribute("UiFxBound") then return end
+	button:SetAttribute("UiFxBound", true)
+
+	local icon = getIcon(button)
+	local scale = getOrMakeScale(button)
+
+	local hovering = false
+	local pressing = false
+
+	local function applyState()
+		if pressing then
+			if icon then tween(icon, PRESS_INFO, {Rotation = PRESS_ROT}) end
+			tween(scale, PRESS_INFO, {Scale = PRESS_SCALE})
+		elseif hovering then
+			if icon then tween(icon, HOVER_INFO, {Rotation = HOVER_ROT}) end
+			tween(scale, HOVER_INFO, {Scale = HOVER_SCALE})
+		else
+			if icon then tween(icon, RELEASE_INFO, {Rotation = DEFAULT_ROT}) end
+			tween(scale, RELEASE_INFO, {Scale = NORMAL_SCALE})
+		end
+	end
+
+	button.MouseEnter:Connect(function() hovering = true; applyState() end)
+	button.MouseLeave:Connect(function() hovering = false; pressing = false; applyState() end)
+
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = true; applyState()
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = false; applyState()
+		end
+	end)
+
+	button.Activated:Connect(function()
+		tween(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.88})
+		task.delay(0.07, applyState)
+	end)
+end
+
+-- Scale-only effect (no icon): for BaseButton, SellButton, ShopButton
+local function setupScaleOnlyButton(button: ImageButton)
+	if button:GetAttribute("UiFxBound") then return end
+	button:SetAttribute("UiFxBound", true)
+
+	local scale = getOrMakeScale(button)
+
+	local hovering = false
+	local pressing = false
+
+	local function applyState()
+		if pressing then
+			tween(scale, PRESS_INFO, {Scale = PRESS_SCALE})
+		elseif hovering then
+			tween(scale, HOVER_INFO, {Scale = HOVER_SCALE})
+		else
+			tween(scale, RELEASE_INFO, {Scale = NORMAL_SCALE})
+		end
+	end
+
+	button.MouseEnter:Connect(function() hovering = true; applyState() end)
+	button.MouseLeave:Connect(function() hovering = false; pressing = false; applyState() end)
+
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = true; applyState()
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = false; applyState()
+		end
+	end)
+
+	button.Activated:Connect(function()
+		tween(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.88})
+		task.delay(0.07, applyState)
+	end)
+end
+
+-- Exit buttons everywhere: works for ImageButton/TextButton/Frame-based buttons
+local function setupExitButtonEffect(target: GuiObject)
+	if target:GetAttribute("UiFxBound") then return end
+	target:SetAttribute("UiFxBound", true)
+
+	local scale = getOrMakeScale(target)
+	local buttonLike: GuiButton
+	if target:IsA("GuiButton") then
+		buttonLike = target
+	else
+		buttonLike = ensureHitbox(target)
+	end
+
+	local hovering = false
+	local pressing = false
+
+	local function applyState()
+		if pressing then
+			tween(scale, PRESS_INFO, {Scale = PRESS_SCALE})
+		elseif hovering then
+			tween(scale, HOVER_INFO, {Scale = HOVER_SCALE})
+		else
+			tween(scale, RELEASE_INFO, {Scale = NORMAL_SCALE})
+		end
+	end
+
+	buttonLike.MouseEnter:Connect(function() hovering = true; applyState() end)
+	buttonLike.MouseLeave:Connect(function() hovering = false; pressing = false; applyState() end)
+
+	buttonLike.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = true; applyState()
+		end
+	end)
+	buttonLike.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = false; applyState()
+		end
+	end)
+
+	buttonLike.Activated:Connect(function()
+		tween(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.88})
+		task.delay(0.07, applyState)
+	end)
+end
+
+-- SpinButton: scale + SpinWheel full spin on hover
+local function setupSpinButton(button: ImageButton)
+	if button:GetAttribute("UiFxBound") then return end
+	button:SetAttribute("UiFxBound", true)
+
+	local wheel = button:FindFirstChild("SpinWheel") :: ImageLabel
+	local scale = getOrMakeScale(button)
+
+	local spinning = false
+	local hovering = false
+	local pressing = false
+
+	local function spinWheel()
+		if spinning or not wheel then return end
+		spinning = true
+		wheel.Rotation = 0
+		tween(wheel, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Rotation = 360})
+		task.delay(0.45, function()
+			wheel.Rotation = 0
+			spinning = false
+		end)
+	end
+
+	local function applyState()
+		if pressing then
+			tween(scale, PRESS_INFO, {Scale = PRESS_SCALE})
+		elseif hovering then
+			tween(scale, HOVER_INFO, {Scale = HOVER_SCALE})
+		else
+			tween(scale, RELEASE_INFO, {Scale = NORMAL_SCALE})
+		end
+	end
+
+	button.MouseEnter:Connect(function()
+		hovering = true
+		applyState()
+		spinWheel()
+	end)
+	button.MouseLeave:Connect(function()
+		hovering = false
+		pressing = false
+		applyState()
+	end)
+
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = true; applyState()
+			spinWheel()
+		end
+	end)
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			pressing = false; applyState()
+		end
+	end)
+
+	button.Activated:Connect(function()
+		tween(scale, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.88})
+		task.delay(0.07, applyState)
+		spinWheel()
+	end)
+end
+
+-- Slide-in entrance animation
+local function slideIn(gui: GuiObject, index: number)
+	local original = gui.Position
+	gui.Position = UDim2.new(original.X.Scale, original.X.Offset - SLIDE_DISTANCE, original.Y.Scale, original.Y.Offset)
+	task.delay((index - 1) * STAGGER, function()
+		if gui.Parent then tween(gui, SLIDE_INFO, {Position = original}) end
+	end)
+end
+
+local targets = {}
+for _, child in ipairs(leftHUD:GetChildren()) do
+	if child:IsA("GuiObject") then table.insert(targets, child) end
+end
+table.sort(targets, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+for i, gui in ipairs(targets) do slideIn(gui, i) end
+
+-- Hook up LeftHUD buttons (icon + scale)
+for _, desc in ipairs(leftHUD:GetDescendants()) do
+	if desc:IsA("ImageButton") then setupButton(desc) end
+end
+
+-- Hook up TopHUD buttons (scale only)
+local scaleOnlyNames = {"BaseButton", "SellButton", "ShopButton"}
+for _, name in ipairs(scaleOnlyNames) do
+	local btn = topHUD:FindFirstChild(name) :: ImageButton
+	if btn then setupScaleOnlyButton(btn) end
+end
+
+-- Hook up SpinButton
+setupSpinButton(spinButton)
+
+-- Hook up ALL ExitButton/Exitbutton controls in FullGameGUI
+for _, desc in ipairs(fullGui:GetDescendants()) do
+	if desc:IsA("GuiObject") then
+		local n = desc.Name:lower()
+		if n == "exitbutton" then
+			setupExitButtonEffect(desc)
+		end
+	end
+end
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.UIAnim.UIWiringController (LocalScript) ---
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local SocialService = game:GetService("SocialService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local gui = playerGui:WaitForChild("FullGameGUI")
+local hudFrame = gui:WaitForChild("HUDFrame")
+local leftHUD = hudFrame:WaitForChild("LeftHUD")
+local topHUD = hudFrame:WaitForChild("TopHUD")
+
+local OPEN_INFO  = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local CLOSE_INFO = TweenInfo.new(0.18, Enum.EasingStyle.Quad,  Enum.EasingDirection.Out)
+
+local openFrame: Frame? = nil
+
+local function closeFrame(frame: Frame)
+	local t = TweenService:Create(frame, CLOSE_INFO, {Size = UDim2.fromScale(0, 0)})
+	local originalSize = frame.Size
+	t:Play()
+	t.Completed:Connect(function()
+		frame.Visible = false
+		frame.Size = originalSize
+	end)
+end
+
+local function openFrameAnim(frame: Frame)
+	local targetSize = frame.Size
+	frame.Size = UDim2.fromScale(0, 0)
+	frame.Visible = true
+	TweenService:Create(frame, OPEN_INFO, {Size = targetSize}):Play()
+end
+
+local function toggleFrame(frame: Frame)
+	if openFrame == frame then
+		closeFrame(frame)
+		openFrame = nil
+	else
+		if openFrame then closeFrame(openFrame) end
+		openFrame = frame
+		openFrameAnim(frame)
+	end
+end
+
+local function teleportTo(position: Vector3)
+	local char = player.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		hrp.CFrame = CFrame.new(position + Vector3.new(0, 5, 0))
+	end
+end
+
+local function wireExitButton(frame: Frame, path: string)
+	local cur: Instance = frame
+	for _, part in ipairs(string.split(path, ".")) do
+		cur = cur:FindFirstChild(part)
+		if not cur then return end
+	end
+	local clickable = cur
+	if not (clickable:IsA("ImageButton") or clickable:IsA("TextButton")) then
+		clickable = cur:FindFirstChildOfClass("ImageButton") 
+			or cur:FindFirstChildOfClass("TextButton")
+			or cur
+	end
+	if clickable then
+		if clickable:IsA("ImageButton") or clickable:IsA("TextButton") then
+			clickable.Activated:Connect(function()
+				closeFrame(frame)
+				if openFrame == frame then openFrame = nil end
+			end)
+		else
+			clickable.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					closeFrame(frame)
+					if openFrame == frame then openFrame = nil end
+				end
+			end)
+		end
+	end
+end
+
+local frameWires = {
+	{ button = leftHUD:WaitForChild("ConfigButton"),  frame = gui:WaitForChild("SettingsFrame"), exit = "Header.ExitButton" },
+	{ button = leftHUD:WaitForChild("GiftsButton"),   frame = gui:WaitForChild("Dailrewards"),   exit = "Header.ExitButton" },
+	{ button = leftHUD:WaitForChild("IndexButton"),   frame = gui:WaitForChild("IndexFrame"),    exit = "Header.ExitButton" },
+	{ button = leftHUD:WaitForChild("RebirthButton"), frame = gui:WaitForChild("Rebirth"),       exit = "Header.ExitButton" },
+	{ button = leftHUD:WaitForChild("StoreButton"),   frame = gui:WaitForChild("ShopFrame"),     exit = "Header.ExitButton" },
+	{ button = hudFrame:WaitForChild("SpinButton"),   frame = gui:WaitForChild("SpinFrame"),     exit = "Exitbutton" },
+}
+
+for _, wire in ipairs(frameWires) do
+	wire.frame.Visible = false
+end
+
+for _, wire in ipairs(frameWires) do
+	wire.button.Activated:Connect(function()
+		toggleFrame(wire.frame)
+	end)
+	wireExitButton(wire.frame, wire.exit)
+end
+
+-- InviteButton: Roblox invite prompt
+leftHUD:WaitForChild("InviteButton").Activated:Connect(function()
+	local success, err = pcall(function()
+		SocialService:PromptGameInvite(player)
+	end)
+	if not success then
+		warn("InvitePrompt failed: " .. tostring(err))
+	end
+end)
+
+-- SellButton: teleport to SellShop
+topHUD:WaitForChild("SellButton").Activated:Connect(function()
+	teleportTo(Vector3.new(293.5, 8.75, -11.45))
+end)
+
+-- ShopButton: teleport to CarShop
+topHUD:WaitForChild("ShopButton").Activated:Connect(function()
+	teleportTo(Vector3.new(293.5, 8.75, -127.45))
+end)
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.UIAnim.SpeedEffectClient (LocalScript) ---
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+local gui = player:WaitForChild("PlayerGui"):WaitForChild("FullGameGUI")
+local template = gui:WaitForChild("TemplateEfect")
+
+local speedRemotes = ReplicatedStorage:WaitForChild("SpeedRemotes", 30)
+if not speedRemotes then
+	warn("[SpeedEffectClient] SpeedRemotes missing")
+	return
+end
+
+local speedGained = speedRemotes:WaitForChild("SpeedGained", 30)
+if not speedGained then
+	warn("[SpeedEffectClient] SpeedGained missing")
+	return
+end
+
+local function showEffect(amount: number)
+	local clone = template:Clone()
+	clone.Name = "EfectActiv"
+	clone.Parent = gui
+	clone.Visible = true
+
+	local value = math.max(1, math.floor(amount or 1))	
+	clone.Text = "+" .. tostring(value) .. " SPEED"
+
+	-- Make it much larger and brighter for readability
+	clone.Size = UDim2.new(0, 420, 0, 130)
+	clone.TextScaled = false
+	clone.TextSize = 64
+	clone.Font = Enum.Font.GothamBlack
+	clone.TextColor3 = Color3.fromRGB(255, 255, 80) -- bright yellow
+	clone.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	clone.TextStrokeTransparency = 0
+	clone.TextTransparency = 0
+	clone.BackgroundTransparency = 1
+	clone.ZIndex = 999
+
+	local randomX = math.random(38, 62) / 100
+	local randomY = math.random(48, 58) / 100
+	clone.Position = UDim2.new(randomX, -210, randomY, -65)
+	clone:TweenPosition(
+		UDim2.new(randomX, -210, randomY - 0.22, -65),
+		Enum.EasingDirection.Out,
+		Enum.EasingStyle.Quart,
+		0.95,
+		true
+	)
+
+	Debris:AddItem(clone, 1.2)
+end
+
+speedGained.OnClientEvent:Connect(function(amount)
+	showEffect(amount)
+end)
+
+print("[SpeedEffectClient] Ready!")
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.UIAnim.RebirthClient (LocalScript) ---
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BrainrotConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("BrainrotConfig"))
+
+local SKIP_REBIRTH_PRODUCT_ID = 3548596307
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local fullGui = playerGui:WaitForChild("FullGameGUI")
+local rebirthFrame = fullGui:WaitForChild("Rebirth")
+
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local rebirthRemotes = remotes:WaitForChild("RebirthRemotes")
+local getRebirthData = rebirthRemotes:WaitForChild("GetRebirthData")
+local requestRebirth = rebirthRemotes:WaitForChild("RequestRebirth")
+local rebirthUpdated = rebirthRemotes:WaitForChild("RebirthUpdated")
+local promptProduct = remotes:WaitForChild("PromptProduct")
+
+local content = rebirthFrame:WaitForChild("Content")
+local buttons = content:WaitForChild("Buttons")
+local rebirthButton = buttons:WaitForChild("RebirthButton") :: ImageButton
+local skipRebirthButton = buttons:WaitForChild("SkipRebirthButton"):WaitForChild("SkipButton") :: ImageButton
+
+local rebirthInfo = content:WaitForChild("RebirthInfo")
+local rewardBeforeLabel = rebirthInfo:WaitForChild("Before"):WaitForChild("Content"):WaitForChild("RewardBefore") :: TextLabel
+local rewardAfterLabel = rebirthInfo:WaitForChild("After"):WaitForChild("Content"):WaitForChild("RewardAfter") :: TextLabel
+local rebirthBeforeLabel = rebirthInfo:WaitForChild("Rebirthbefore") :: TextLabel
+local rebirthAfterLabel = rebirthInfo:WaitForChild("RebirthAfter") :: TextLabel
+
+local barProgression = content:WaitForChild("BarInfo"):WaitForChild("BarProgression")
+local barFill = barProgression:WaitForChild("Bar") :: GuiObject
+local uiLayout = barProgression:WaitForChild("Uilayout")
+local progressText = uiLayout:FindFirstChild("$0/$100") :: TextLabel
+if not progressText then
+	for _, child in ipairs(uiLayout:GetChildren()) do
+		if child:IsA("TextLabel") and child.Text:find("/") then
+			progressText = child
+			break
+		end
+	end
+end
+
+local rebirthButtonText: TextLabel? = rebirthButton:FindFirstChild("REBIRTH") :: TextLabel
+
+local defaultBarSize = barFill.Size
+
+local function formatMoney(n: number): string
+	return "$" .. BrainrotConfig.FormatMoney(math.floor(n))
+end
+
+local function formatMult(n: number): string
+	local rounded = math.floor(n * 100 + 0.5) / 100
+	if rounded % 1 == 0 then
+		return "x" .. tostring(math.floor(rounded))
+	end
+	return "x" .. string.format("%.2f", rounded)
+end
+
+local function applyState(state)
+	if not state then return end
+
+	local beforeMult = tonumber(state.BeforeMultiplier) or 1
+	local afterMult = tonumber(state.AfterMultiplier) or 1
+	local money = tonumber(state.Money) or 0
+	local cost = math.max(1, tonumber(state.Cost) or 1)
+	local canRebirth = state.CanRebirth == true
+	local level = tonumber(state.RebirthLevel) or 0
+
+	rewardBeforeLabel.Text = formatMult(beforeMult)
+	rewardAfterLabel.Text = formatMult(afterMult)
+	rebirthBeforeLabel.Text = "Rebirth " .. tostring(level)
+	rebirthAfterLabel.Text = "Rebirth " .. tostring(level + 1)
+
+	if progressText then
+		progressText.Text = formatMoney(money) .. "/" .. formatMoney(cost)
+	end
+
+	local alpha = math.clamp(money / cost, 0, 1)
+	barFill.Size = UDim2.new(alpha, defaultBarSize.X.Offset, defaultBarSize.Y.Scale, defaultBarSize.Y.Offset)
+
+	rebirthButton.Active = canRebirth
+	rebirthButton.AutoButtonColor = canRebirth
+	rebirthButton.ImageTransparency = canRebirth and 0 or 0.35
+	if rebirthButtonText then
+		rebirthButtonText.TextTransparency = canRebirth and 0 or 0.25
+	end
+end
+
+local function refresh()
+	local ok, response = pcall(function()
+		return getRebirthData:InvokeServer()
+	end)
+	if ok and type(response) == "table" and response.Success and response.State then
+		applyState(response.State)
+	end
+end
+
+rebirthButton.Activated:Connect(function()
+	local ok, response = pcall(function()
+		return requestRebirth:InvokeServer("Normal")
+	end)
+	if ok and type(response) == "table" then
+		if response.Success and response.State then
+			applyState(response.State)
+		else
+			refresh()
+		end
+	end
+end)
+
+skipRebirthButton.Activated:Connect(function()
+	promptProduct:FireServer(SKIP_REBIRTH_PRODUCT_ID)
+end)
+
+rebirthUpdated.OnClientEvent:Connect(function(state)
+	applyState(state)
+end)
+
+local leaderstats = player:WaitForChild("leaderstats")
+local moneyValue = leaderstats:WaitForChild("Money")
+local rebirthValue = leaderstats:WaitForChild("Rebirth")
+moneyValue.Changed:Connect(refresh)
+rebirthValue.Changed:Connect(refresh)
+
+refresh()
+print("[RebirthClient] Ready!")
+
+---
+
+--- StarterPlayer.StarterPlayerScripts.ShopTouchUiClient (LocalScript) ---
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local TOUCH_COOLDOWN = 0.6
+local lastTouchAt = 0
+
+local SHOP_TO_FRAME = {
+	CarShop = "ItemShopFrame",
+	CarryShop = "UpgradesFrame",
+	FuelShop = "UpgradesFrame",
+	SellShop = "SellShop",
+}
+
+local function isFromLocalCharacter(part: BasePart): boolean
+	local character = player.Character
+	if not character then return false end
+	return part:IsDescendantOf(character)
+end
+
+local function getPlayerGui(): PlayerGui?
+	return player:FindFirstChildOfClass("PlayerGui")
+end
+
+local function openFrame(frameName: string)
+	local playerGui = getPlayerGui()
+	if not playerGui then return end
+
+	local target: GuiObject? = nil
+	for _, inst in playerGui:GetDescendants() do
+		if inst:IsA("GuiObject") and inst.Name == frameName then
+			target = inst
+			break
+		end
+	end
+	if not target then return end
+
+	-- Ensure all parent ScreenGuis are enabled.
+	local ancestor = target.Parent
+	while ancestor do
+		if ancestor:IsA("ScreenGui") then
+			ancestor.Enabled = true
+		end
+		ancestor = ancestor.Parent
+	end
+
+	target.Visible = true
+end
+
+local function onTouched(otherPart: BasePart, frameName: string)
+	if not isFromLocalCharacter(otherPart) then return end
+
+	local now = os.clock()
+	if (now - lastTouchAt) < TOUCH_COOLDOWN then
+		return
+	end
+	lastTouchAt = now
+
+	openFrame(frameName)
+end
+
+local function bindMiscModel(miscModel: Instance, frameName: string)
+	local function bindPart(part: Instance)
+		if part:IsA("BasePart") then
+			part.Touched:Connect(function(other)
+				onTouched(other, frameName)
+			end)
+		end
+	end
+
+	for _, d in miscModel:GetDescendants() do
+		bindPart(d)
+	end
+
+	miscModel.DescendantAdded:Connect(bindPart)
+end
+
+local function setup()
+	local world = workspace:WaitForChild("World")
+	local shops = world:WaitForChild("Shops")
+
+	for shopName, frameName in SHOP_TO_FRAME do
+		local shopModel = shops:FindFirstChild(shopName)
+		if shopModel then
+			local misc = shopModel:FindFirstChild("Misc")
+			if misc then
+				bindMiscModel(misc, frameName)
+			end
+		end
+	end
+end
+
+setup()
+
 ---
